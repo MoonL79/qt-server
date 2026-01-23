@@ -12,8 +12,24 @@ if (POLICY CMP0141)
 endif()
 
 project ("qt-server")
+find_package(Boost 1.83 REQUIRED COMPONENTS system)
+find_package(Threads REQUIRED)
 
-# 将源代码添加到此项目的可执行文件。
-add_executable (qt-server "src/main.cpp")
+add_executable (qt-server
+    "src/main.cpp"
+    "src/server/echo_server.cpp"
+    "src/server/session.cpp"
+    "src/utils/logger.cpp"
+)
 
-# TODO: 如有需要，请添加测试并安装目标。
+target_link_libraries(qt-server
+PRIVATE
+    Boost::system
+    Threads::Threads
+)
+
+target_include_directories(qt-server
+PRIVATE
+    ${Boost_INCLUDE_DIRS}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
