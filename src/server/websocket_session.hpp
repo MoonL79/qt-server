@@ -4,6 +4,7 @@
 #include <boost/beast/core.hpp>
 #include <boost/beast/websocket.hpp>
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/json.hpp>
 #include <memory>
 #include <string>
 #include <iostream>
@@ -15,14 +16,24 @@ namespace beast = boost::beast;         // from <boost/beast.hpp>
 namespace http = beast::http;           // from <boost/beast/http.hpp>
 namespace websocket = beast::websocket; // from <boost/beast/websocket.hpp>
 namespace net = boost::asio;            // from <boost/asio.hpp>
+namespace json = boost::json;           // from <boost/json.hpp>
 using tcp = boost::asio::ip::tcp;       // from <boost/asio/ip/tcp.hpp>
 
 // Echoes back all received WebSocket messages
 class websocket_session : public std::enable_shared_from_this<websocket_session>
 {
+    struct envelope
+    {
+        std::string type;
+        std::string action;
+        std::string request_id;
+        json::object data;
+    };
+
     websocket::stream<tcp::socket> ws_;
     beast::flat_buffer buffer_;
     std::string remote_endpoint_;
+    std::string outbound_message_;
 
 public:
     // Take ownership of the socket
@@ -33,6 +44,26 @@ public:
     void run();
 
 private:
+    static bool is_supported_type(const std::string& type);
+    static bool is_supported_action(const std::string& type, const std::string& action);
+    static bool require_string_field(const json::object& obj,
+                                     const char* field,
+                                     std::string& error_message);
+    static bool require_bool_field(const json::object& obj,
+                                   const char* field,
+                                   std::string& error_message);
+    static bool validate_data_schema(const std::string& type,
+                                     const std::string& action,
+                                     const json::object& data,
+                                     std::string& error_message);
+    static bool parse_envelope(const std::string& payload, envelope& out, std::string& error_message);
+    static std::string build_response_payload(const std::string& type,
+                                              const std::string& action,
+                                              const std::string& request_id,
+                                              bool ok,
+                                              const std::string& message,
+                                              json::object data);
+
     void on_accept(beast::error_code ec);
 
     void do_read();

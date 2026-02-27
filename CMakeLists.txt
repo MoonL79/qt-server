@@ -12,7 +12,7 @@ if (POLICY CMP0141)
 endif()
 
 project ("qt-server")
-find_package(Boost 1.83 REQUIRED COMPONENTS system)
+find_package(Boost 1.83 REQUIRED COMPONENTS system json)
 find_package(Threads REQUIRED)
 
 add_executable (qt-server
@@ -26,6 +26,7 @@ add_executable (qt-server
 target_link_libraries(qt-server
 PRIVATE
     Boost::system
+    Boost::json
     Threads::Threads
 )
 

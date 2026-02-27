@@ -1,101 +1,138 @@
-# WebSocket 改造说明（commit: 71af329a6ab60478311f428734b2ea5554756a06）
+# WebSocket 通信协议（V1）
 
-## 1. 改造目标
+## 1. 总体信封格式
 
-本次提交将服务端连接处理从原有 `session`（TCP echo）切换为 `websocket_session`（WebSocket echo），实现基于 Boost.Beast 的异步 WebSocket 握手、收包、回包流程。
-
-## 2. 变更文件
-
-- `CMakeLists.txt`
-- `src/server/echo_server.cpp`
-- `src/server/session.cpp`
-- `src/server/websocket_session.cpp`（新增）
-- `src/server/websocket_session.hpp`（新增）
-
-## 3. 核心改动说明
-
-### 3.1 构建系统
-
-在 `CMakeLists.txt` 中新增了 `src/server/websocket_session.cpp`，确保新会话类参与编译链接。
-
-### 3.2 接入点切换
-
-`src/server/echo_server.cpp` 中的连接处理从：
-
-- `std::make_shared<session>(std::move(socket))->start();`
-
-切换为：
-
-- `std::make_shared<websocket_session>(std::move(socket))->run();`
-
-同时头文件由 `session.hpp` 改为 `websocket_session.hpp`。
-
-这意味着服务端在 `accept` 后不再走纯 TCP echo 流程，而是进入 WebSocket 会话生命周期。
-
-### 3.3 新增 `websocket_session`
-
-`websocket_session` 采用 `std::enable_shared_from_this` + 异步回调链，包含以下阶段：
-
-1. `run()`
-- 设置服务端推荐超时参数：`websocket::stream_base::timeout::suggested(...)`
-- 设置握手响应 `Server` 头
-- 发起异步握手：`async_accept(...)`
-
-2. `on_accept(...)`
-- 握手成功后进入读流程 `do_read()`
-- 记录并打印连接客户端地址
-
-3. `do_read()` / `on_read(...)`
-- 异步读取 WebSocket 帧到 `beast::flat_buffer`
-- 打印接收日志
-- 保持文本/二进制类型：`ws_.text(ws_.got_text())`
-- 将收到的原始负载原样回写（echo）
-
-4. `on_write(...)`
-- 发送完成后清空 buffer：`buffer_.consume(buffer_.size())`
-- 继续下一轮读取，形成循环
-
-5. 析构
-- 会话结束时打印关闭日志
-
-### 3.4 原 `session.cpp` 的变化
-
-`session.cpp` 仅增加了更详细的日志输出（收到字节数、回写提示），功能仍是 TCP echo。  
-注意：当前 `echo_server` 已切到 `websocket_session`，因此运行路径主要是 WebSocket，会话类 `session` 目前不再是主路径。
-
-## 4. 当前行为特性
-
-- 服务端支持 WebSocket 握手。
-- 收到客户端消息后，按原内容直接回显。
-- 支持持续收发（写完继续读）。
-- 连接/消息/关闭都有控制台日志，便于联调。
-
-## 5. 与 JSON 协议的关系
-
-本提交实现的是 **WebSocket 传输层改造 + echo 回显**，尚未在服务端内置 JSON 业务协议解析与路由。  
-即目前消息体按原始字符串/二进制透传回写，不会解析诸如：
+客户端到服务端、服务端到客户端统一使用以下 JSON 文本帧：
 
 ```json
 {
   "type": "AUTH | PROFILE | MESSAGE",
-  "action": "具体动作",
+  "action": "枚举动作",
   "request_id": "uuid",
   "data": {}
 }
 ```
 
-如果后续要落地该 JSON 协议，建议在 `websocket_session::on_read(...)` 中增加：
+字段规则：
+- `type`: 必填，字符串，枚举：`AUTH`、`PROFILE`、`MESSAGE`
+- `action`: 必填，字符串，且必须属于对应 `type` 的动作枚举
+- `request_id`: 必填，字符串，建议 UUID，由请求方生成，响应方原样回传
+- `data`: 必填，对象，根据 `type + action` 使用不同结构
 
-- JSON 解析与字段校验（`type/action/request_id/data`）
-- 按 `type + action` 分发到业务处理器
-- 统一响应格式（含 `request_id` 以便客户端关联）
-- 错误码与异常响应规范
+## 2. Action 枚举
 
-## 6. 验证建议
+### 2.1 AUTH
+- `LOGIN`
+- `LOGOUT`
+- `REFRESH_TOKEN`
 
-可用任意 WebSocket 客户端（浏览器、`wscat`、Qt 客户端）验证：
+### 2.2 PROFILE
+- `GET`
+- `UPDATE`
 
-1. 建立连接能成功握手。
-2. 发送文本消息后，服务端原样回显。
-3. 连续多次发送，服务端持续响应且无阻塞。
-4. 断开连接后服务端打印关闭日志。
+### 2.3 MESSAGE
+- `SEND`
+- `PULL`
+- `ACK`
+
+## 3. 三类 data 格式
+
+### 3.1 AUTH 的 data
+
+1. `action = LOGIN`
+```json
+{
+  "username": "string",
+  "password": "string"
+}
+```
+
+2. `action = LOGOUT`
+```json
+{
+  "token": "string"
+}
+```
+
+3. `action = REFRESH_TOKEN`
+```json
+{
+  "refresh_token": "string"
+}
+```
+
+### 3.2 PROFILE 的 data
+
+1. `action = GET`
+```json
+{
+  "user_id": "string"
+}
+```
+
+2. `action = UPDATE`
+```json
+{
+  "user_id": "string",
+  "nickname": "string",
+  "avatar_url": "string"
+}
+```
+
+### 3.3 MESSAGE 的 data
+
+1. `action = SEND`
+```json
+{
+  "conversation_id": "string",
+  "content": "string"
+}
+```
+
+2. `action = PULL`
+```json
+{
+  "conversation_id": "string"
+}
+```
+
+3. `action = ACK`
+```json
+{
+  "conversation_id": "string",
+  "message_id": "string",
+  "read": true
+}
+```
+
+## 4. 响应格式
+
+服务端响应仍使用同一信封结构：
+
+```json
+{
+  "type": "与请求一致，异常时可能为 MESSAGE",
+  "action": "与请求一致，异常时可能为 ERROR",
+  "request_id": "与请求一致，解析失败时可能为空字符串",
+  "data": {
+    "ok": true,
+    "message": "request accepted"
+  }
+}
+```
+
+当前实现中：
+- 校验通过：`data.ok = true`，并附带 `data.echo`（回显请求 data）
+- 校验失败：`data.ok = false`，`data.message` 给出原因，可能附带 `data.received_payload`
+
+## 5. 服务端校验行为
+
+服务端已在 `src/server/websocket_session.cpp` 中强制校验：
+- 必须为文本帧（不支持二进制帧）
+- 必须是 JSON 对象
+- 必须包含并正确类型化 `type/action/request_id/data`
+- `type` 必须是 `AUTH/PROFILE/MESSAGE`
+- `action` 必须与 `type` 匹配
+- `data` 必须满足本文件第 3 节定义的字段约束
+
+任一校验失败都会返回统一错误响应，不会断开连接。
