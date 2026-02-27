@@ -19,6 +19,7 @@ add_executable (qt-server
     "src/main.cpp"
     "src/server/echo_server.cpp"
     "src/server/session.cpp"
+    "src/server/websocket_session.cpp"
     "src/utils/logger.cpp"
 )
 

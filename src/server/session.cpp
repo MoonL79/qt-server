@@ -44,7 +44,10 @@ void session::do_read()
         {
             if (!error)
             {
+                std::cout << "Received " << length << " bytes: "
+                          << std::string(buffer_.data(), length) << std::endl;
                 // Echo模式：收到什么就回写什么
+                std::cout << "Echoing " << length << " bytes back to client." << std::endl;
                 do_write(length);
             }
             else

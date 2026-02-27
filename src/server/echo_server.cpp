@@ -1,5 +1,5 @@
 #include "echo_server.hpp"
-#include "session.hpp"
+#include "websocket_session.hpp"
 #include <iostream>
 #include <thread>
 #include <functional>
@@ -57,8 +57,8 @@ void echo_server::do_accept()
         {
             if (!error)
             {
-                // 创建新的session来处理连接
-                std::make_shared<session>(std::move(socket))->start();
+                // 创建新的websocket_session来处理连接
+                std::make_shared<websocket_session>(std::move(socket))->run();
             }
             else
             {
