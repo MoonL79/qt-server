@@ -4,10 +4,40 @@
 #include <thread>
 #include <chrono>
 #include <csignal>
+#include <cstdlib>
 #include "server/echo_server.hpp"
 
 // 全局服务器指针，用于信号处理
 qt_server::server::echo_server* g_server = nullptr;
+
+namespace {
+
+void set_env_if_absent(const char* key, const char* value)
+{
+    const char* existing = std::getenv(key);
+    if (existing != nullptr && *existing != '\0') {
+        return;
+    }
+#if defined(_WIN32)
+    _putenv_s(key, value);
+#else
+    setenv(key, value, 0);
+#endif
+    std::cout << "[env-init] " << key << " is empty, apply default value." << std::endl;
+}
+
+void init_runtime_mysql_env_defaults()
+{
+    // Fallbacks for remote-debug sessions where IDE does not inject env vars.
+    // Production should still prefer explicit environment configuration.
+    set_env_if_absent("QT_SERVER_MYSQL_HOST", "127.0.0.1");
+    set_env_if_absent("QT_SERVER_MYSQL_PORT", "3306");
+    set_env_if_absent("QT_SERVER_MYSQL_DB", "app_db");
+    set_env_if_absent("QT_SERVER_MYSQL_USER", "app_user");
+    set_env_if_absent("QT_SERVER_MYSQL_PASSWORD", "123456");
+}
+
+} // namespace
 
 // 信号处理函数
 void signal_handler(int signal)
@@ -20,6 +50,8 @@ void signal_handler(int signal)
 
 int main(int argc, char* argv[])
 {
+    init_runtime_mysql_env_defaults();
+
     // 设置信号处理
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);

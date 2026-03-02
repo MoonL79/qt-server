@@ -25,6 +25,7 @@
 
 ### 2.1 AUTH
 - `LOGIN`
+- `REGISTER`
 - `LOGOUT`
 - `REFRESH_TOKEN`
 
@@ -56,7 +57,20 @@
 }
 ```
 
-3. `action = REFRESH_TOKEN`
+3. `action = REGISTER`
+```json
+{
+  "username": "string, 必填，3~32，仅允许字母数字下划线",
+  "email": "string, 必填，最大128，合法邮箱格式",
+  "password": "string, 必填，8~64，且必须包含大小写字母和数字",
+  "nickname": "string, 必填，1~64",
+  "phone": "string, 可选，最大32",
+  "avatar_url": "string, 可选，最大255",
+  "bio": "string, 可选，最大255"
+}
+```
+
+4. `action = REFRESH_TOKEN`
 ```json
 {
   "refresh_token": "string"
@@ -103,7 +117,7 @@
 {
   "conversation_id": "string",
   "message_id": "string",
-  "read": true
+  "delivered": true
 }
 ```
 
@@ -125,8 +139,41 @@
 ```
 
 当前实现中：
-- 请求成功：`code = 0`，`data.ok = true`，并附带 `data.echo`（回显请求 data）
+- 请求成功：`code = 0`，`data.ok = true`，并附带 `data.echo`（回显请求 data；`AUTH` 类请求会自动脱敏 `password/token/refresh_token`）
+- `AUTH/REGISTER` 成功时，额外返回 `data.user`，结构如下：
+```json
+{
+  "user_id": "string",
+  "user_uuid": "string",
+  "username": "string",
+  "email": "string",
+  "phone": "string",
+  "nickname": "string",
+  "avatar_url": "string",
+  "bio": "string",
+  "status": 1,
+  "created_at": "UTC ISO8601"
+}
+```
+- `AUTH/REGISTER` 会真实写入数据库表：`user_data` 与 `user_im_profile`
 - 请求失败：`code != 0`，`data.ok = false`，`data.message` 给出原因，可能附带 `data.received_payload`
+
+说明：服务端将 `password` 转为 `password_hash` 后再入库，当前实现为 `PBKDF2-HMAC-SHA256`（随机盐 + 高迭代），满足生产可用的基础密码存储要求。
+
+### 4.1 注册接口对应的数据表
+
+- `user_data`：写入 `username/email/phone/password_hash/status/created_at/updated_at`
+- `user_im_profile`：写入 `user_id/user_uuid/nickname/avatar_url/bio/is_online/...`
+
+### 4.2 服务器数据库连接配置（环境变量）
+
+服务端 `AUTH/REGISTER` 通过本机 `mysql` 客户端执行事务写入，配置项如下：
+
+- `QT_SERVER_MYSQL_HOST`（必填）
+- `QT_SERVER_MYSQL_PORT`（必填）
+- `QT_SERVER_MYSQL_DB`（必填）
+- `QT_SERVER_MYSQL_USER`（必填）
+- `QT_SERVER_MYSQL_PASSWORD`（必填）
 
 ## 5. 状态码（第一版）
 
@@ -147,6 +194,8 @@
 - `2003`：TOKEN_EXPIRED
 - `2004`：LOGIN_FAILED
 - `2005`：PERMISSION_DENIED
+- `2006`：REGISTER_CONFLICT
+- `2007`：REGISTER_FAILED
 
 ### 5.3 PROFILE
 

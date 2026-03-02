@@ -36,6 +36,8 @@ class websocket_session : public std::enable_shared_from_this<websocket_session>
         TOKEN_EXPIRED = 2003,
         LOGIN_FAILED = 2004,
         PERMISSION_DENIED = 2005,
+        REGISTER_CONFLICT = 2006,
+        REGISTER_FAILED = 2007,
         PROFILE_NOT_FOUND = 3001,
         PROFILE_UPDATE_CONFLICT = 3002,
         PROFILE_VALIDATION_FAILED = 3003,
@@ -76,6 +78,14 @@ private:
     static bool require_bool_field(const json::object& obj,
                                    const char* field,
                                    std::string& error_message);
+    static bool validate_optional_string_max_len(const json::object& obj,
+                                                 const char* field,
+                                                 std::size_t max_len,
+                                                 std::string& error_message);
+    static bool handle_register(const json::object& data,
+                                json::object& response_data,
+                                std::string& message,
+                                protocol_code& response_code);
     static bool validate_data_schema(const std::string& type,
                                      const std::string& action,
                                      const json::object& data,
