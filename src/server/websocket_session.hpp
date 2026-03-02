@@ -22,6 +22,30 @@ using tcp = boost::asio::ip::tcp;       // from <boost/asio/ip/tcp.hpp>
 // Echoes back all received WebSocket messages
 class websocket_session : public std::enable_shared_from_this<websocket_session>
 {
+    enum class protocol_code : int
+    {
+        OK = 0,
+        INVALID_REQUEST = 1001,
+        INVALID_ACTION = 1002,
+        INVALID_PARAM = 1003,
+        UNSUPPORTED_TYPE = 1004,
+        REQUEST_ID_MISSING = 1005,
+        INTERNAL_ERROR = 1099,
+        AUTH_REQUIRED = 2001,
+        TOKEN_INVALID = 2002,
+        TOKEN_EXPIRED = 2003,
+        LOGIN_FAILED = 2004,
+        PERMISSION_DENIED = 2005,
+        PROFILE_NOT_FOUND = 3001,
+        PROFILE_UPDATE_CONFLICT = 3002,
+        PROFILE_VALIDATION_FAILED = 3003,
+        MESSAGE_INVALID = 4001,
+        MESSAGE_TOO_LARGE = 4002,
+        MESSAGE_TARGET_OFFLINE = 4003,
+        MESSAGE_RATE_LIMITED = 4004,
+        MESSAGE_NOT_FOUND = 4005
+    };
+
     struct envelope
     {
         std::string type;
@@ -55,11 +79,16 @@ private:
     static bool validate_data_schema(const std::string& type,
                                      const std::string& action,
                                      const json::object& data,
-                                     std::string& error_message);
-    static bool parse_envelope(const std::string& payload, envelope& out, std::string& error_message);
+                                     std::string& error_message,
+                                     protocol_code& error_code);
+    static bool parse_envelope(const std::string& payload,
+                               envelope& out,
+                               std::string& error_message,
+                               protocol_code& error_code);
     static std::string build_response_payload(const std::string& type,
                                               const std::string& action,
                                               const std::string& request_id,
+                                              protocol_code code,
                                               bool ok,
                                               const std::string& message,
                                               json::object data);

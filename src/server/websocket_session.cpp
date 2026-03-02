@@ -54,64 +54,101 @@ bool websocket_session::require_bool_field(const json::object& obj,
 bool websocket_session::validate_data_schema(const std::string& type,
                                              const std::string& action,
                                              const json::object& data,
-                                             std::string& error_message)
+                                             std::string& error_message,
+                                             protocol_code& error_code)
 {
     if (type == "AUTH") {
         if (action == "LOGIN") {
-            return require_string_field(data, "username", error_message)
-                && require_string_field(data, "password", error_message);
+            if (!require_string_field(data, "username", error_message)
+                || !require_string_field(data, "password", error_message)) {
+                error_code = protocol_code::INVALID_PARAM;
+                return false;
+            }
+            return true;
         }
         if (action == "LOGOUT") {
-            return require_string_field(data, "token", error_message);
+            if (!require_string_field(data, "token", error_message)) {
+                error_code = protocol_code::INVALID_PARAM;
+                return false;
+            }
+            return true;
         }
         if (action == "REFRESH_TOKEN") {
-            return require_string_field(data, "refresh_token", error_message);
+            if (!require_string_field(data, "refresh_token", error_message)) {
+                error_code = protocol_code::INVALID_PARAM;
+                return false;
+            }
+            return true;
         }
     }
 
     if (type == "PROFILE") {
         if (action == "GET") {
-            return require_string_field(data, "user_id", error_message);
+            if (!require_string_field(data, "user_id", error_message)) {
+                error_code = protocol_code::PROFILE_VALIDATION_FAILED;
+                return false;
+            }
+            return true;
         }
         if (action == "UPDATE") {
-            return require_string_field(data, "user_id", error_message)
-                && require_string_field(data, "nickname", error_message)
-                && require_string_field(data, "avatar_url", error_message);
+            if (!require_string_field(data, "user_id", error_message)
+                || !require_string_field(data, "nickname", error_message)
+                || !require_string_field(data, "avatar_url", error_message)) {
+                error_code = protocol_code::PROFILE_VALIDATION_FAILED;
+                return false;
+            }
+            return true;
         }
     }
 
     if (type == "MESSAGE") {
         if (action == "SEND") {
-            return require_string_field(data, "conversation_id", error_message)
-                && require_string_field(data, "content", error_message);
+            if (!require_string_field(data, "conversation_id", error_message)
+                || !require_string_field(data, "content", error_message)) {
+                error_code = protocol_code::MESSAGE_INVALID;
+                return false;
+            }
+            return true;
         }
         if (action == "PULL") {
-            return require_string_field(data, "conversation_id", error_message);
+            if (!require_string_field(data, "conversation_id", error_message)) {
+                error_code = protocol_code::MESSAGE_INVALID;
+                return false;
+            }
+            return true;
         }
         if (action == "ACK") {
-            return require_string_field(data, "conversation_id", error_message)
-                && require_string_field(data, "message_id", error_message)
-                && require_bool_field(data, "read", error_message);
+            if (!require_string_field(data, "conversation_id", error_message)
+                || !require_string_field(data, "message_id", error_message)
+                || !require_bool_field(data, "read", error_message)) {
+                error_code = protocol_code::MESSAGE_INVALID;
+                return false;
+            }
+            return true;
         }
     }
 
     error_message = "unsupported type/action combination";
+    error_code = protocol_code::INVALID_ACTION;
     return false;
 }
 
 bool websocket_session::parse_envelope(const std::string& payload,
                                        envelope& out,
-                                       std::string& error_message)
+                                       std::string& error_message,
+                                       protocol_code& error_code)
 {
     boost::system::error_code ec;
     json::value parsed = json::parse(payload, ec);
     if (ec) {
         error_message = "invalid JSON payload";
+        error_code = protocol_code::INVALID_REQUEST;
         return false;
     }
 
     if (!parsed.is_object()) {
         error_message = "payload must be a JSON object";
+        error_code = protocol_code::INVALID_REQUEST;
         return false;
     }
 
@@ -124,18 +161,22 @@ bool websocket_session::parse_envelope(const std::string& payload,
 
     if (type_it == root.end() || !type_it->value().is_string()) {
         error_message = "field 'type' is required and must be string";
+        error_code = protocol_code::INVALID_REQUEST;
         return false;
     }
     if (action_it == root.end() || !action_it->value().is_string()) {
         error_message = "field 'action' is required and must be string";
+        error_code = protocol_code::INVALID_REQUEST;
         return false;
     }
     if (request_id_it == root.end() || !request_id_it->value().is_string()) {
         error_message = "field 'request_id' is required and must be string";
+        error_code = protocol_code::REQUEST_ID_MISSING;
         return false;
     }
     if (data_it == root.end() || !data_it->value().is_object()) {
         error_message = "field 'data' is required and must be object";
+        error_code = protocol_code::INVALID_REQUEST;
         return false;
     }
 
@@ -146,34 +187,40 @@ bool websocket_session::parse_envelope(const std::string& payload,
 
     if (!is_supported_type(out.type)) {
         error_message = "field 'type' must be one of AUTH, PROFILE, MESSAGE";
+        error_code = protocol_code::UNSUPPORTED_TYPE;
         return false;
     }
 
     if (out.action.empty()) {
         error_message = "field 'action' cannot be empty";
+        error_code = protocol_code::INVALID_ACTION;
         return false;
     }
 
     if (!is_supported_action(out.type, out.action)) {
         error_message = "field 'action' is not supported for this 'type'";
+        error_code = protocol_code::INVALID_ACTION;
         return false;
     }
 
     if (out.request_id.empty()) {
         error_message = "field 'request_id' cannot be empty";
+        error_code = protocol_code::REQUEST_ID_MISSING;
         return false;
     }
 
-    if (!validate_data_schema(out.type, out.action, out.data, error_message)) {
+    if (!validate_data_schema(out.type, out.action, out.data, error_message, error_code)) {
         return false;
     }
 
+    error_code = protocol_code::OK;
     return true;
 }
 
 std::string websocket_session::build_response_payload(const std::string& type,
                                                       const std::string& action,
                                                       const std::string& request_id,
+                                                      protocol_code code,
                                                       bool ok,
                                                       const std::string& message,
                                                       json::object data)
@@ -185,6 +232,7 @@ std::string websocket_session::build_response_payload(const std::string& type,
     response["type"] = type;
     response["action"] = action;
     response["request_id"] = request_id;
+    response["code"] = static_cast<int>(code);
     response["data"] = std::move(data);
     return json::serialize(response);
 }
@@ -275,19 +323,22 @@ void websocket_session::on_read(
     std::string response_type = "MESSAGE";
     std::string response_action = "ERROR";
     std::string response_request_id;
+    protocol_code response_code = protocol_code::INTERNAL_ERROR;
     bool ok = false;
     std::string message;
 
     if (!ws_.got_text()) {
+        response_code = protocol_code::INVALID_REQUEST;
         message = "binary frame is not supported, use text JSON payload";
         response_data["received_format"] = "binary";
-    } else if (!parse_envelope(payload, request, error_message)) {
+    } else if (!parse_envelope(payload, request, error_message, response_code)) {
         message = error_message;
         response_data["received_payload"] = payload;
     } else {
         response_type = request.type;
         response_action = request.action;
         response_request_id = request.request_id;
+        response_code = protocol_code::OK;
         if (request.type == "AUTH" && request.action == "LOGIN") {
             ok = true;
             message = "login accepted (verification disabled)";
@@ -299,7 +350,13 @@ void websocket_session::on_read(
     }
 
     outbound_message_ = build_response_payload(
-        response_type, response_action, response_request_id, ok, message, std::move(response_data));
+        response_type,
+        response_action,
+        response_request_id,
+        response_code,
+        ok,
+        message,
+        std::move(response_data));
 
     if (!remote_endpoint_.empty()) {
         std::cout << "Sending JSON response to " << remote_endpoint_
