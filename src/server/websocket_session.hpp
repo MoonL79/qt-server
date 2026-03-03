@@ -86,6 +86,18 @@ private:
                                 json::object& response_data,
                                 std::string& message,
                                 protocol_code& response_code);
+    static bool handle_login(const json::object& data,
+                             json::object& response_data,
+                             std::string& message,
+                             protocol_code& response_code);
+    static bool handle_profile_get_info(const json::object& data,
+                                        json::object& response_data,
+                                        std::string& message,
+                                        protocol_code& response_code);
+    static bool handle_profile_set_info(const json::object& data,
+                                        json::object& response_data,
+                                        std::string& message,
+                                        protocol_code& response_code);
     static bool validate_data_schema(const std::string& type,
                                      const std::string& action,
                                      const json::object& data,

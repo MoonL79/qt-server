@@ -147,6 +147,51 @@ std::string bytes_to_hex(const std::vector<unsigned char>& bytes)
     return oss.str();
 }
 
+int hex_nibble(char ch)
+{
+    if (ch >= '0' && ch <= '9') {
+        return ch - '0';
+    }
+    if (ch >= 'a' && ch <= 'f') {
+        return 10 + (ch - 'a');
+    }
+    if (ch >= 'A' && ch <= 'F') {
+        return 10 + (ch - 'A');
+    }
+    return -1;
+}
+
+bool hex_to_bytes(const std::string& hex, std::vector<unsigned char>& out)
+{
+    if ((hex.size() % 2U) != 0U) {
+        return false;
+    }
+    out.clear();
+    out.reserve(hex.size() / 2U);
+    for (std::size_t i = 0; i < hex.size(); i += 2U) {
+        const int high = hex_nibble(hex[i]);
+        const int low = hex_nibble(hex[i + 1U]);
+        if (high < 0 || low < 0) {
+            return false;
+        }
+        out.push_back(static_cast<unsigned char>((high << 4) | low));
+    }
+    return true;
+}
+
+bool constant_time_equal(const std::vector<unsigned char>& lhs,
+                         const std::vector<unsigned char>& rhs)
+{
+    if (lhs.size() != rhs.size()) {
+        return false;
+    }
+    unsigned char diff = 0U;
+    for (std::size_t i = 0; i < lhs.size(); ++i) {
+        diff = static_cast<unsigned char>(diff | (lhs[i] ^ rhs[i]));
+    }
+    return diff == 0U;
+}
+
 uint32_t rotr32(uint32_t x, uint32_t n)
 {
     return (x >> n) | (x << (32U - n));
@@ -338,6 +383,53 @@ std::string hash_password_for_storage(const std::string& plain_password)
     std::ostringstream oss;
     oss << "pbkdf2_sha256$" << iterations << "$" << bytes_to_hex(salt) << "$" << bytes_to_hex(dk);
     return oss.str();
+}
+
+bool verify_password_against_storage(const std::string& plain_password,
+                                     const std::string& stored_hash)
+{
+    const std::string prefix = "pbkdf2_sha256$";
+    if (stored_hash.rfind(prefix, 0) != 0U) {
+        return false;
+    }
+
+    const std::string body = stored_hash.substr(prefix.size());
+    const std::size_t p1 = body.find('$');
+    if (p1 == std::string::npos) {
+        return false;
+    }
+    const std::size_t p2 = body.find('$', p1 + 1U);
+    if (p2 == std::string::npos) {
+        return false;
+    }
+
+    const std::string iterations_text = body.substr(0, p1);
+    const std::string salt_hex = body.substr(p1 + 1U, p2 - (p1 + 1U));
+    const std::string digest_hex = body.substr(p2 + 1U);
+
+    if (iterations_text.empty() || salt_hex.empty() || digest_hex.empty()) {
+        return false;
+    }
+
+    int iterations = 0;
+    std::istringstream iter_stream(iterations_text);
+    iter_stream >> iterations;
+    if (iter_stream.fail() || iterations <= 0) {
+        return false;
+    }
+
+    std::vector<unsigned char> salt;
+    std::vector<unsigned char> stored_digest;
+    if (!hex_to_bytes(salt_hex, salt) || !hex_to_bytes(digest_hex, stored_digest)) {
+        return false;
+    }
+    if (stored_digest.empty()) {
+        return false;
+    }
+
+    const std::vector<unsigned char> password_bytes(plain_password.begin(), plain_password.end());
+    const std::vector<unsigned char> computed = pbkdf2_hmac_sha256(password_bytes, salt, iterations, stored_digest.size());
+    return constant_time_equal(stored_digest, computed);
 }
 
 std::string read_string_or_empty(const json::object& obj, const char* field)
@@ -542,6 +634,70 @@ bool parse_unsigned_long_long(const std::string& input, unsigned long long& valu
     return !iss.fail();
 }
 
+std::vector<std::string> split_by_tab(const std::string& input)
+{
+    std::vector<std::string> parts;
+    std::size_t begin = 0;
+    while (begin <= input.size()) {
+        const std::size_t end = input.find('\t', begin);
+        if (end == std::string::npos) {
+            parts.push_back(input.substr(begin));
+            break;
+        }
+        parts.push_back(input.substr(begin, end - begin));
+        begin = end + 1;
+    }
+    return parts;
+}
+
+std::vector<std::string> collect_non_empty_lines(const std::string& text)
+{
+    std::vector<std::string> lines;
+    std::istringstream iss(text);
+    std::string line;
+    while (std::getline(iss, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        if (!line.empty()) {
+            lines.push_back(line);
+        }
+    }
+    return lines;
+}
+
+bool parse_profile_row_line(const std::string& row_line,
+                            std::string& avatar_url,
+                            std::string& nickname,
+                            std::string& signature,
+                            std::string& theme)
+{
+    const std::vector<std::string> cols = split_by_tab(row_line);
+    if (cols.size() < 4U) {
+        return false;
+    }
+    avatar_url = (cols[0] == "\\N") ? "" : cols[0];
+    nickname = (cols[1] == "\\N") ? "" : cols[1];
+    signature = (cols[2] == "\\N") ? "" : cols[2];
+    theme = (cols[3] == "\\N") ? "default" : cols[3];
+    if (theme.empty()) {
+        theme = "default";
+    }
+    return true;
+}
+
+bool parse_user_id_from_data(const json::object& data,
+                             unsigned long long& user_id,
+                             std::string& error_message)
+{
+    const std::string user_id_text = trim_copy(read_string_or_empty(data, "user_id"));
+    if (!parse_unsigned_long_long(user_id_text, user_id)) {
+        error_message = "field 'data.user_id' must be unsigned integer string";
+        return false;
+    }
+    return true;
+}
+
 bool is_mysql_config_valid(const mysql_config& cfg, std::string& reason)
 {
     if (cfg.host.empty()) {
@@ -606,7 +762,7 @@ bool websocket_session::is_supported_action(const std::string& type, const std::
         return action == "LOGIN" || action == "REGISTER" || action == "LOGOUT" || action == "REFRESH_TOKEN";
     }
     if (type == "PROFILE") {
-        return action == "GET" || action == "UPDATE";
+        return action == "GET" || action == "GET_INFO" || action == "SET_INFO" || action == "UPDATE";
     }
     if (type == "MESSAGE") {
         return action == "SEND" || action == "PULL" || action == "ACK";
@@ -743,10 +899,46 @@ bool websocket_session::validate_data_schema(const std::string& type,
             }
             return true;
         }
+        if (action == "GET_INFO") {
+            if (!require_string_field(data, "user_id", error_message)) {
+                error_code = protocol_code::PROFILE_VALIDATION_FAILED;
+                return false;
+            }
+            return true;
+        }
         if (action == "UPDATE") {
             if (!require_string_field(data, "user_id", error_message)
                 || !require_string_field(data, "nickname", error_message)
                 || !require_string_field(data, "avatar_url", error_message)) {
+                error_code = protocol_code::PROFILE_VALIDATION_FAILED;
+                return false;
+            }
+            return true;
+        }
+        if (action == "SET_INFO") {
+            if (!require_string_field(data, "user_id", error_message)
+                || !require_string_field(data, "avatar_url", error_message)
+                || !require_string_field(data, "nickname", error_message)
+                || !require_string_field(data, "signature", error_message)
+                || !validate_optional_string_max_len(data, "theme", 32, error_message)) {
+                error_code = protocol_code::PROFILE_VALIDATION_FAILED;
+                return false;
+            }
+            const std::string nickname = trim_copy(read_string_or_empty(data, "nickname"));
+            const std::string avatar_url = trim_copy(read_string_or_empty(data, "avatar_url"));
+            const std::string signature = trim_copy(read_string_or_empty(data, "signature"));
+            if (nickname.size() > 64) {
+                error_message = "field 'data.nickname' length must be <= 64";
+                error_code = protocol_code::PROFILE_VALIDATION_FAILED;
+                return false;
+            }
+            if (avatar_url.size() > 255) {
+                error_message = "field 'data.avatar_url' length must be <= 255";
+                error_code = protocol_code::PROFILE_VALIDATION_FAILED;
+                return false;
+            }
+            if (signature.size() > 255) {
+                error_message = "field 'data.signature' length must be <= 255";
                 error_code = protocol_code::PROFILE_VALIDATION_FAILED;
                 return false;
             }
@@ -881,6 +1073,276 @@ bool websocket_session::handle_register(const json::object& data,
     response_data["user"] = std::move(user_data);
     response_code = protocol_code::OK;
     message = "register accepted";
+    return true;
+}
+
+bool websocket_session::handle_login(const json::object& data,
+                                     json::object& response_data,
+                                     std::string& message,
+                                     protocol_code& response_code)
+{
+    const std::string username = trim_copy(read_string_or_empty(data, "username"));
+    const std::string plain_password = read_string_or_empty(data, "password");
+
+    const mysql_config cfg = load_mysql_config();
+    response_data["debug"] = build_mysql_config_debug(cfg);
+    std::string config_error;
+    if (!is_mysql_config_valid(cfg, config_error)) {
+        response_code = protocol_code::LOGIN_FAILED;
+        message = "login failed: database config missing";
+        response_data["debug"].as_object()["config_error"] = config_error;
+        return false;
+    }
+
+    std::ostringstream sql;
+    sql << "SELECT "
+        << "u.id, "
+        << "u.username, "
+        << "u.email, "
+        << "COALESCE(u.phone, ''), "
+        << "u.status, "
+        << "u.password_hash, "
+        << "COALESCE(p.user_uuid, ''), "
+        << "COALESCE(p.nickname, ''), "
+        << "COALESCE(p.avatar_url, ''), "
+        << "COALESCE(p.bio, '') "
+        << "FROM user_data u "
+        << "LEFT JOIN user_im_profile p ON p.user_id=u.id AND p.deleted_at IS NULL "
+        << "WHERE u.username='" << sql_escape(username) << "' "
+        << "LIMIT 1;";
+
+    std::string command_output;
+    int exit_code = 0;
+    if (!run_mysql_sql(cfg, sql.str(), command_output, exit_code)) {
+        response_code = protocol_code::LOGIN_FAILED;
+        message = "login failed in database";
+        response_data["debug"].as_object()["mysql_exit_code"] = exit_code;
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    const std::vector<std::string> lines = collect_non_empty_lines(command_output);
+    if (lines.empty()) {
+        response_code = protocol_code::LOGIN_FAILED;
+        message = "invalid username or password";
+        return false;
+    }
+
+    const std::vector<std::string> cols = split_by_tab(lines.back());
+    if (cols.size() < 10U) {
+        response_code = protocol_code::LOGIN_FAILED;
+        message = "invalid username or password";
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    unsigned long long user_id = 0;
+    unsigned long long status = 0;
+    if (!parse_unsigned_long_long(cols[0], user_id) || !parse_unsigned_long_long(cols[4], status)) {
+        response_code = protocol_code::LOGIN_FAILED;
+        message = "invalid username or password";
+        return false;
+    }
+
+    const std::string password_hash = cols[5];
+    if (!verify_password_against_storage(plain_password, password_hash)) {
+        response_code = protocol_code::LOGIN_FAILED;
+        message = "invalid username or password";
+        return false;
+    }
+
+    if (status == 0ULL) {
+        response_code = protocol_code::PERMISSION_DENIED;
+        message = "account is disabled";
+        return false;
+    }
+
+    std::ostringstream update_sql;
+    update_sql << "UPDATE user_data SET last_login_at=NOW(), updated_at=NOW() WHERE id=" << user_id << "; "
+               << "UPDATE user_im_profile SET is_online=1, last_seen_at=NOW(), updated_at=NOW() "
+               << "WHERE user_id=" << user_id << " AND deleted_at IS NULL;";
+    std::string update_output;
+    int update_exit_code = 0;
+    if (!run_mysql_sql(cfg, update_sql.str(), update_output, update_exit_code)) {
+        response_data["debug"].as_object()["login_update_mysql_exit_code"] = update_exit_code;
+        response_data["debug"].as_object()["login_update_mysql_output"] = update_output;
+    }
+
+    json::object user_data;
+    user_data["user_id"] = std::to_string(user_id);
+    user_data["username"] = (cols[1] == "\\N") ? "" : cols[1];
+    user_data["email"] = (cols[2] == "\\N") ? "" : cols[2];
+    user_data["phone"] = (cols[3] == "\\N") ? "" : cols[3];
+    user_data["status"] = static_cast<int>(status);
+    user_data["user_uuid"] = (cols[6] == "\\N") ? "" : cols[6];
+    user_data["nickname"] = (cols[7] == "\\N") ? "" : cols[7];
+    user_data["avatar_url"] = (cols[8] == "\\N") ? "" : cols[8];
+    user_data["bio"] = (cols[9] == "\\N") ? "" : cols[9];
+    response_data["user"] = std::move(user_data);
+
+    response_code = protocol_code::OK;
+    message = "login accepted";
+    return true;
+}
+
+bool websocket_session::handle_profile_get_info(const json::object& data,
+                                                json::object& response_data,
+                                                std::string& message,
+                                                protocol_code& response_code)
+{
+    unsigned long long user_id = 0;
+    std::string parse_error;
+    if (!parse_user_id_from_data(data, user_id, parse_error)) {
+        response_code = protocol_code::PROFILE_VALIDATION_FAILED;
+        message = parse_error;
+        return false;
+    }
+
+    const mysql_config cfg = load_mysql_config();
+    response_data["debug"] = build_mysql_config_debug(cfg);
+    std::string config_error;
+    if (!is_mysql_config_valid(cfg, config_error)) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "profile get failed: database config missing";
+        response_data["debug"].as_object()["config_error"] = config_error;
+        return false;
+    }
+
+    std::ostringstream sql;
+    sql << "SELECT "
+        << "COALESCE(avatar_url, ''), "
+        << "COALESCE(nickname, ''), "
+        << "COALESCE(JSON_UNQUOTE(JSON_EXTRACT(extra, '$.signature')), ''), "
+        << "COALESCE(JSON_UNQUOTE(JSON_EXTRACT(extra, '$.theme')), 'default') "
+        << "FROM user_im_profile "
+        << "WHERE user_id=" << user_id << " AND deleted_at IS NULL "
+        << "LIMIT 1;";
+
+    std::string command_output;
+    int exit_code = 0;
+    if (!run_mysql_sql(cfg, sql.str(), command_output, exit_code)) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "profile get failed in database";
+        response_data["debug"].as_object()["mysql_exit_code"] = exit_code;
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    const std::vector<std::string> lines = collect_non_empty_lines(command_output);
+    if (lines.empty()) {
+        response_code = protocol_code::PROFILE_NOT_FOUND;
+        message = "profile not found";
+        return false;
+    }
+
+    std::string avatar_url;
+    std::string nickname;
+    std::string signature;
+    std::string theme;
+    if (!parse_profile_row_line(lines.back(), avatar_url, nickname, signature, theme)) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "profile get failed: unexpected database output";
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    json::object profile;
+    profile["avatar_url"] = avatar_url;
+    profile["nickname"] = nickname;
+    profile["signature"] = signature;
+    profile["theme"] = theme;
+    response_data["profile"] = std::move(profile);
+    response_code = protocol_code::OK;
+    message = "profile info request accepted";
+    return true;
+}
+
+bool websocket_session::handle_profile_set_info(const json::object& data,
+                                                json::object& response_data,
+                                                std::string& message,
+                                                protocol_code& response_code)
+{
+    unsigned long long user_id = 0;
+    std::string parse_error;
+    if (!parse_user_id_from_data(data, user_id, parse_error)) {
+        response_code = protocol_code::PROFILE_VALIDATION_FAILED;
+        message = parse_error;
+        return false;
+    }
+
+    const std::string avatar_url = trim_copy(read_string_or_empty(data, "avatar_url"));
+    const std::string nickname = trim_copy(read_string_or_empty(data, "nickname"));
+    const std::string signature = trim_copy(read_string_or_empty(data, "signature"));
+    const std::string requested_theme = trim_copy(read_string_or_empty(data, "theme"));
+    const std::string theme = requested_theme.empty() ? "default" : requested_theme;
+
+    const mysql_config cfg = load_mysql_config();
+    response_data["debug"] = build_mysql_config_debug(cfg);
+    std::string config_error;
+    if (!is_mysql_config_valid(cfg, config_error)) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "profile set failed: database config missing";
+        response_data["debug"].as_object()["config_error"] = config_error;
+        return false;
+    }
+
+    std::ostringstream sql;
+    sql << "START TRANSACTION; "
+        << "UPDATE user_im_profile SET "
+        << "nickname='" << sql_escape(nickname) << "', "
+        << "avatar_url='" << sql_escape(avatar_url) << "', "
+        << "extra=JSON_SET(COALESCE(extra, JSON_OBJECT()), "
+        << "'$.signature', '" << sql_escape(signature) << "', "
+        << "'$.theme', '" << sql_escape(theme) << "'), "
+        << "updated_at=NOW() "
+        << "WHERE user_id=" << user_id << " AND deleted_at IS NULL; "
+        << "SELECT ROW_COUNT(); "
+        << "SELECT "
+        << "COALESCE(avatar_url, ''), "
+        << "COALESCE(nickname, ''), "
+        << "COALESCE(JSON_UNQUOTE(JSON_EXTRACT(extra, '$.signature')), ''), "
+        << "COALESCE(JSON_UNQUOTE(JSON_EXTRACT(extra, '$.theme')), 'default') "
+        << "FROM user_im_profile "
+        << "WHERE user_id=" << user_id << " AND deleted_at IS NULL "
+        << "LIMIT 1; "
+        << "COMMIT;";
+
+    std::string command_output;
+    int exit_code = 0;
+    if (!run_mysql_sql(cfg, sql.str(), command_output, exit_code)) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "profile set failed in database";
+        response_data["debug"].as_object()["mysql_exit_code"] = exit_code;
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    const std::vector<std::string> lines = collect_non_empty_lines(command_output);
+    if (lines.size() < 2U) {
+        response_code = protocol_code::PROFILE_NOT_FOUND;
+        message = "profile not found";
+        return false;
+    }
+
+    std::string saved_avatar_url;
+    std::string saved_nickname;
+    std::string saved_signature;
+    std::string saved_theme;
+    if (!parse_profile_row_line(lines[1], saved_avatar_url, saved_nickname, saved_signature, saved_theme)) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "profile set failed: unexpected profile row";
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    json::object profile;
+    profile["avatar_url"] = saved_avatar_url;
+    profile["nickname"] = saved_nickname;
+    profile["signature"] = saved_signature;
+    profile["theme"] = saved_theme;
+    response_data["profile"] = std::move(profile);
+    response_code = protocol_code::OK;
+    message = "profile info set accepted";
     return true;
 }
 
@@ -1091,10 +1553,13 @@ void websocket_session::on_read(
         response_request_id = request.request_id;
         response_code = protocol_code::OK;
         if (request.type == "AUTH" && request.action == "LOGIN") {
-            ok = true;
-            message = "login accepted (verification disabled)";
+            ok = handle_login(request.data, response_data, message, response_code);
         } else if (request.type == "AUTH" && request.action == "REGISTER") {
             ok = handle_register(request.data, response_data, message, response_code);
+        } else if (request.type == "PROFILE" && request.action == "GET_INFO") {
+            ok = handle_profile_get_info(request.data, response_data, message, response_code);
+        } else if (request.type == "PROFILE" && request.action == "SET_INFO") {
+            ok = handle_profile_set_info(request.data, response_data, message, response_code);
         } else {
             ok = true;
             message = "request accepted";

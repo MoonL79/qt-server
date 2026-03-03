@@ -42,6 +42,10 @@
 ### 3.2 PROFILE
 
 - `GET`：`{ "user_id": "string" }`
+- `GET_INFO`：`{ "user_id": "string" }`，响应 `data.profile` 包含：
+  `avatar_url`、`nickname`、`signature`、`theme`（未设置默认 `default`）
+- `SET_INFO`：`{ "user_id", "avatar_url", "nickname", "signature", "theme?" }`，
+  响应 `data.profile` 返回数据库保存后的个人信息
 - `UPDATE`：`{ "user_id": "string", "nickname": "string", "avatar_url": "string" }`
 
 ### 3.3 MESSAGE
@@ -66,15 +70,14 @@
 
 状态码第一版清单与映射说明见：`docs/status_codes.md`。
 
-## 5. 登录特例（按当前需求）
+## 5. 登录校验（当前实现）
 
-目前不存在真实登录校验逻辑。  
-服务端对 `AUTH + LOGIN` 请求在格式合法时固定返回：
+服务端已启用 `AUTH + LOGIN` 的真实账号密码校验：
 
-- `data.ok = true`
-- `data.message = "login accepted (verification disabled)"`
-
-即：账号密码内容不参与真伪校验，仅做协议字段校验。
+- 从 `user_data` 查询 `password_hash`
+- 使用同注册流程一致的 `PBKDF2-HMAC-SHA256` 规则进行密码校验
+- 校验失败返回 `2004 LOGIN_FAILED`
+- 校验成功返回 `data.user`，并更新 `last_login_at` 与在线状态字段
 
 ## 6. 构建依赖调整
 

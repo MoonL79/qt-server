@@ -31,6 +31,8 @@
 
 ### 2.2 PROFILE
 - `GET`
+- `GET_INFO`
+- `SET_INFO`
 - `UPDATE`
 
 ### 2.3 MESSAGE
@@ -86,7 +88,46 @@
 }
 ```
 
-2. `action = UPDATE`
+2. `action = GET_INFO`（个人信息请求）
+```json
+{
+  "user_id": "string"
+}
+```
+
+成功响应会在 `data.profile` 中返回个人信息：
+```json
+{
+  "avatar_url": "string",
+  "nickname": "string",
+  "signature": "string",
+  "theme": "string，未设置时默认 default"
+}
+```
+
+3. `action = SET_INFO`（个人信息设置）
+```json
+{
+  "user_id": "string",
+  "avatar_url": "string, 必填，最大255",
+  "nickname": "string, 必填，最大64",
+  "signature": "string, 必填，最大255",
+  "theme": "string, 可选，最大32"
+}
+```
+
+成功响应会在 `data.profile` 回显保存后的个人信息：
+```json
+{
+  "avatar_url": "string",
+  "nickname": "string",
+  "signature": "string",
+  "theme": "string，若请求未传或为空则为 default"
+}
+```
+说明：`signature/theme` 存储于 `user_im_profile.extra`（JSON）中。
+
+4. `action = UPDATE`
 ```json
 {
   "user_id": "string",
@@ -156,6 +197,8 @@
 }
 ```
 - `AUTH/REGISTER` 会真实写入数据库表：`user_data` 与 `user_im_profile`
+- `PROFILE/GET_INFO` 会从 `user_im_profile` 读取资料（含 `extra.signature/extra.theme`）
+- `PROFILE/SET_INFO` 会更新 `user_im_profile.nickname/avatar_url/extra.signature/extra.theme`
 - 请求失败：`code != 0`，`data.ok = false`，`data.message` 给出原因，可能附带 `data.received_payload`
 
 说明：服务端将 `password` 转为 `password_hash` 后再入库，当前实现为 `PBKDF2-HMAC-SHA256`（随机盐 + 高迭代），满足生产可用的基础密码存储要求。
