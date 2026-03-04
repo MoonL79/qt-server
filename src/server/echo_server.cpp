@@ -3,16 +3,26 @@
 #include <iostream>
 #include <thread>
 #include <functional>
+#include <utility>
 
 namespace qt_server {
 namespace server {
 
-echo_server::echo_server(unsigned short port)
+echo_server::echo_server(unsigned short ws_port,
+                         unsigned short static_port,
+                         std::string static_root,
+                         std::string public_host,
+                         std::string public_scheme)
     : io_context_()
-    , acceptor_(io_context_, tcp::endpoint(tcp::v4(), port))
+    , acceptor_(io_context_, tcp::endpoint(tcp::v4(), ws_port))
+    , http_static_server_(new http_static_server(io_context_,
+                                                 static_port,
+                                                 std::move(static_root),
+                                                 std::move(public_host),
+                                                 std::move(public_scheme)))
     , stopped_(false)
 {
-    std::cout << "Echo server initialized on port " << port << std::endl;
+    std::cout << "Echo server initialized on port " << ws_port << std::endl;
     do_accept();
 }
 

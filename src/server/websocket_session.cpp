@@ -1,4 +1,5 @@
 #include "server/websocket_session.hpp"
+#include "server/upload_token_store.hpp"
 #include <boost/beast/core/buffers_to_string.hpp>
 #include <chrono>
 #include <cctype>
@@ -916,11 +917,16 @@ bool websocket_session::validate_data_schema(const std::string& type,
             return true;
         }
         if (action == "SET_INFO") {
+            const auto signature_it = data.find("signature");
             if (!require_string_field(data, "user_id", error_message)
                 || !require_string_field(data, "avatar_url", error_message)
                 || !require_string_field(data, "nickname", error_message)
-                || !require_string_field(data, "signature", error_message)
+                || signature_it == data.end()
+                || !signature_it->value().is_string()
                 || !validate_optional_string_max_len(data, "theme", 32, error_message)) {
+                if (signature_it == data.end() || !signature_it->value().is_string()) {
+                    error_message = "field 'data.signature' is required and must be string";
+                }
                 error_code = protocol_code::PROFILE_VALIDATION_FAILED;
                 return false;
             }
@@ -1179,6 +1185,18 @@ bool websocket_session::handle_login(const json::object& data,
     user_data["avatar_url"] = (cols[8] == "\\N") ? "" : cols[8];
     user_data["bio"] = (cols[9] == "\\N") ? "" : cols[9];
     response_data["user"] = std::move(user_data);
+
+    std::string upload_token;
+    std::string upload_token_expires_at;
+    if (issue_upload_token(user_id, 2 * 60 * 60, upload_token, upload_token_expires_at)) {
+        response_data["upload_token"] = upload_token;
+        response_data["upload_token_expires_at"] = upload_token_expires_at;
+        response_data["upload_token_type"] = "Bearer";
+    } else {
+        response_data["upload_token"] = "";
+        response_data["upload_token_expires_at"] = "";
+        response_data["upload_token_type"] = "Bearer";
+    }
 
     response_code = protocol_code::OK;
     message = "login accepted";
