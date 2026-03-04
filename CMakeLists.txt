@@ -18,6 +18,9 @@ find_package(Threads REQUIRED)
 add_executable (qt-server
     "src/main.cpp"
     "src/server/echo_server.cpp"
+    "src/server/http_static_server.cpp"
+    "src/server/http_static_session.cpp"
+    "src/server/upload_token_store.cpp"
     "src/server/session.cpp"
     "src/server/websocket_session.cpp"
     "src/utils/logger.cpp"

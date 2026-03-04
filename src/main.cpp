@@ -37,6 +37,50 @@ void init_runtime_mysql_env_defaults()
     set_env_if_absent("QT_SERVER_MYSQL_PASSWORD", "123456");
 }
 
+std::string default_static_root_path()
+{
+#if defined(_WIN32)
+    const char* home = std::getenv("USERPROFILE");
+    if (home != nullptr && *home != '\0') {
+        return std::string(home) + "\\qt-server-data";
+    }
+    return ".\\qt-server-data";
+#else
+    const char* home = std::getenv("HOME");
+    if (home != nullptr && *home != '\0') {
+        return std::string(home) + "/qt-server-data";
+    }
+    return "./qt-server-data";
+#endif
+}
+
+unsigned short read_port_env(const char* key, unsigned short fallback)
+{
+    const char* value = std::getenv(key);
+    if (value == nullptr || *value == '\0') {
+        return fallback;
+    }
+    try {
+        const int parsed = std::stoi(value);
+        if (parsed > 0 && parsed < 65536) {
+            return static_cast<unsigned short>(parsed);
+        }
+    } catch (const std::exception&) {
+    }
+    std::cerr << "Invalid " << key << " value: " << value
+              << ", fallback to " << fallback << std::endl;
+    return fallback;
+}
+
+std::string read_string_env(const char* key, const char* fallback)
+{
+    const char* value = std::getenv(key);
+    if (value == nullptr || *value == '\0') {
+        return fallback;
+    }
+    return value;
+}
+
 } // namespace
 
 // 信号处理函数
@@ -51,6 +95,11 @@ void signal_handler(int signal)
 int main(int argc, char* argv[])
 {
     init_runtime_mysql_env_defaults();
+    const std::string default_static_root = default_static_root_path();
+    set_env_if_absent("QT_SERVER_STATIC_PORT", "18080");
+    set_env_if_absent("QT_SERVER_STATIC_ROOT", default_static_root.c_str());
+    set_env_if_absent("QT_SERVER_STATIC_PUBLIC_HOST", "127.0.0.1");
+    set_env_if_absent("QT_SERVER_STATIC_PUBLIC_SCHEME", "http");
 
     // 设置信号处理
     std::signal(SIGINT, signal_handler);
@@ -73,10 +122,23 @@ int main(int argc, char* argv[])
         }
     }
 
-    std::cout << "Starting echo server on port " << port << "..." << std::endl;
+    const unsigned short static_port = read_port_env("QT_SERVER_STATIC_PORT", 18080);
+    const std::string static_root = read_string_env("QT_SERVER_STATIC_ROOT", default_static_root.c_str());
+    const std::string public_host = read_string_env("QT_SERVER_STATIC_PUBLIC_HOST", "127.0.0.1");
+    const std::string public_scheme = read_string_env("QT_SERVER_STATIC_PUBLIC_SCHEME", "http");
+
+    std::cout << "Starting WebSocket server on port " << port << "..." << std::endl;
+    std::cout << "Starting HTTP static server on port " << static_port
+              << ", root=" << static_root << std::endl;
+    std::cout << "HTTP public endpoint: " << public_scheme << "://" << public_host
+              << ":" << static_port << std::endl;
 
     // 创建echo服务器实例
-    qt_server::server::echo_server server(port);
+    qt_server::server::echo_server server(port,
+                                          static_port,
+                                          static_root,
+                                          public_host,
+                                          public_scheme);
     g_server = &server;
 
     // 启动服务器

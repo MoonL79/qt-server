@@ -5,6 +5,7 @@
 #include <memory>
 #include <string>
 #include <atomic>
+#include "http_static_server.hpp"
 
 namespace qt_server {
 namespace server {
@@ -15,7 +16,11 @@ class echo_server
 {
 public:
     // 构造函数：指定监听端口
-    explicit echo_server(unsigned short port);
+    echo_server(unsigned short ws_port,
+                unsigned short static_port,
+                std::string static_root,
+                std::string public_host,
+                std::string public_scheme);
     ~echo_server();
 
     // 启动服务器
@@ -31,6 +36,7 @@ private:
 private:
     boost::asio::io_context io_context_;
     tcp::acceptor acceptor_;
+    std::unique_ptr<http_static_server> http_static_server_;
     std::atomic<bool> stopped_;
 };
 
