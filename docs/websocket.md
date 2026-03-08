@@ -34,6 +34,8 @@
 - `GET_INFO`
 - `SET_INFO`
 - `UPDATE`
+- `ADD_FRIEND`
+- `DELETE_FRIEND`
 
 ### 2.3 MESSAGE
 - `SEND`
@@ -84,7 +86,25 @@
 1. `action = GET`
 ```json
 {
-  "user_id": "string"
+  "numeric_id": "string, 必填，无符号整数字符串"
+}
+```
+
+成功响应会在 `data.profile` 中返回用户信息：
+```json
+{
+  "user_id": "string",
+  "numeric_id": "string",
+  "username": "string",
+  "email": "string",
+  "phone": "string",
+  "status": 1,
+  "user_uuid": "string",
+  "nickname": "string",
+  "avatar_url": "string",
+  "bio": "string",
+  "signature": "string",
+  "theme": "string"
 }
 ```
 
@@ -133,6 +153,41 @@
   "user_id": "string",
   "nickname": "string",
   "avatar_url": "string"
+}
+```
+
+5. `action = ADD_FRIEND`
+```json
+{
+  "user_id": "string, 必填，无符号整数字符串",
+  "friend_user_id": "string, 必填，无符号整数字符串",
+  "remark": "string, 可选，最大255"
+}
+```
+
+成功响应会返回：
+```json
+{
+  "user_id": "string",
+  "friend_user_id": "string",
+  "status": 1
+}
+```
+
+6. `action = DELETE_FRIEND`
+```json
+{
+  "user_id": "string, 必填，无符号整数字符串",
+  "friend_user_id": "string, 必填，无符号整数字符串"
+}
+```
+
+成功响应会返回：
+```json
+{
+  "user_id": "string",
+  "friend_user_id": "string",
+  "removed": true
 }
 ```
 
@@ -185,6 +240,7 @@
 ```json
 {
   "user_id": "string",
+  "numeric_id": "string，纯数字唯一标识，从10000开始递增",
   "user_uuid": "string",
   "username": "string",
   "email": "string",
@@ -197,15 +253,20 @@
 }
 ```
 - `AUTH/REGISTER` 会真实写入数据库表：`user_data` 与 `user_im_profile`
+- `AUTH/REGISTER` 成功响应中的 `data.user.numeric_id` 为纯数字唯一标识（从 `10000` 开始，按注册顺序递增）
+- `PROFILE/GET` 会按 `data.numeric_id` 联查 `user_data + user_im_profile`，返回 `data.profile`
+- `PROFILE/GET` 会对查询结果中的 `user_id` 做一致性校验（需与 `numeric_id` 映射匹配）
 - `PROFILE/GET_INFO` 会从 `user_im_profile` 读取资料（含 `extra.signature/extra.theme`）
 - `PROFILE/SET_INFO` 会更新 `user_im_profile.nickname/avatar_url/extra.signature/extra.theme`
+- `PROFILE/ADD_FRIEND` 会写入 `friendships` 双向关系（`status=1`）
+- `PROFILE/DELETE_FRIEND` 会删除 `friendships` 双向关系（幂等）
 - 请求失败：`code != 0`，`data.ok = false`，`data.message` 给出原因，可能附带 `data.received_payload`
 
 说明：服务端将 `password` 转为 `password_hash` 后再入库，当前实现为 `PBKDF2-HMAC-SHA256`（随机盐 + 高迭代），满足生产可用的基础密码存储要求。
 
 ### 4.1 注册接口对应的数据表
 
-- `user_data`：写入 `username/email/phone/password_hash/status/created_at/updated_at`
+- `user_data`：写入 `username/email/phone/password_hash/status/created_at/updated_at`，并生成 `numeric_id`
 - `user_im_profile`：写入 `user_id/user_uuid/nickname/avatar_url/bio/is_online/...`
 
 ### 4.2 服务器数据库连接配置（环境变量）

@@ -90,6 +90,10 @@ private:
                              json::object& response_data,
                              std::string& message,
                              protocol_code& response_code);
+    static bool handle_profile_get(const json::object& data,
+                                   json::object& response_data,
+                                   std::string& message,
+                                   protocol_code& response_code);
     static bool handle_profile_get_info(const json::object& data,
                                         json::object& response_data,
                                         std::string& message,
@@ -98,6 +102,14 @@ private:
                                         json::object& response_data,
                                         std::string& message,
                                         protocol_code& response_code);
+    static bool handle_profile_add_friend(const json::object& data,
+                                          json::object& response_data,
+                                          std::string& message,
+                                          protocol_code& response_code);
+    static bool handle_profile_delete_friend(const json::object& data,
+                                             json::object& response_data,
+                                             std::string& message,
+                                             protocol_code& response_code);
     static bool validate_data_schema(const std::string& type,
                                      const std::string& action,
                                      const json::object& data,
