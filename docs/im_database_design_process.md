@@ -115,8 +115,23 @@ CREATE TABLE IF NOT EXISTS user_data (
 ### 5.1 user_data（基础账号）
 
 - 主键：`id`
+- 对外数字标识：`numeric_id`（`INT UNSIGNED`，唯一，从 `10000` 开始，按注册顺序递增）
 - 唯一：`username`、`email`
 - 状态与时间：`status`、`last_login_at`、`created_at`、`updated_at`
+
+建议迁移（兼容现有 `id` 主键与外键）：
+
+```sql
+ALTER TABLE user_data
+  ADD COLUMN numeric_id INT UNSIGNED NULL;
+
+UPDATE user_data
+SET numeric_id = CAST(id + 9999 AS UNSIGNED)
+WHERE numeric_id IS NULL;
+
+ALTER TABLE user_data
+  ADD UNIQUE KEY uk_user_data_numeric_id (numeric_id);
+```
 
 ### 5.2 user_im_profile（IM 扩展资料）
 
