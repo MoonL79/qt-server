@@ -106,6 +106,10 @@ private:
                                           json::object& response_data,
                                           std::string& message,
                                           protocol_code& response_code);
+    static bool handle_profile_list_friends(const json::object& data,
+                                            json::object& response_data,
+                                            std::string& message,
+                                            protocol_code& response_code);
     static bool handle_profile_delete_friend(const json::object& data,
                                              json::object& response_data,
                                              std::string& message,

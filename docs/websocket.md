@@ -36,6 +36,7 @@
 - `UPDATE`
 - `ADD_FRIEND`
 - `DELETE_FRIEND`
+- `LIST_FRIENDS`
 
 ### 2.3 MESSAGE
 - `SEND`
@@ -159,8 +160,8 @@
 5. `action = ADD_FRIEND`
 ```json
 {
-  "user_id": "string, 必填，无符号整数字符串",
-  "friend_user_id": "string, 必填，无符号整数字符串",
+  "user_numeric_id": "string, 必填，无符号整数字符串",
+  "friend_numeric_id": "string, 必填，无符号整数字符串",
   "remark": "string, 可选，最大255"
 }
 ```
@@ -168,6 +169,8 @@
 成功响应会返回：
 ```json
 {
+  "user_numeric_id": "string",
+  "friend_numeric_id": "string",
   "user_id": "string",
   "friend_user_id": "string",
   "status": 1
@@ -179,6 +182,32 @@
 {
   "user_id": "string, 必填，无符号整数字符串",
   "friend_user_id": "string, 必填，无符号整数字符串"
+}
+```
+
+7. `action = LIST_FRIENDS`
+```json
+{
+  "numeric_id": "string, 必填，无符号整数字符串"
+}
+```
+
+成功响应会返回：
+```json
+{
+  "numeric_id": "string",
+  "user_id": "string",
+  "friends": [
+    {
+      "user_id": "string",
+      "numeric_id": "string",
+      "username": "string",
+      "status": 1,
+      "nickname": "string",
+      "avatar_url": "string",
+      "bio": "string"
+    }
+  ]
 }
 ```
 
@@ -258,8 +287,9 @@
 - `PROFILE/GET` 会对查询结果中的 `user_id` 做一致性校验（需与 `numeric_id` 映射匹配）
 - `PROFILE/GET_INFO` 会从 `user_im_profile` 读取资料（含 `extra.signature/extra.theme`）
 - `PROFILE/SET_INFO` 会更新 `user_im_profile.nickname/avatar_url/extra.signature/extra.theme`
-- `PROFILE/ADD_FRIEND` 会写入 `friendships` 双向关系（`status=1`）
+- `PROFILE/ADD_FRIEND` 接收 `user_numeric_id/friend_numeric_id`，服务端先映射 `user_id` 再写入 `friendships` 双向关系（`status=1`）
 - `PROFILE/DELETE_FRIEND` 会删除 `friendships` 双向关系（幂等）
+- `PROFILE/LIST_FRIENDS` 会按 `data.numeric_id` 返回该用户的好友列表 `data.friends`
 - 请求失败：`code != 0`，`data.ok = false`，`data.message` 给出原因，可能附带 `data.received_payload`
 
 说明：服务端将 `password` 转为 `password_hash` 后再入库，当前实现为 `PBKDF2-HMAC-SHA256`（随机盐 + 高迭代），满足生产可用的基础密码存储要求。
