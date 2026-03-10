@@ -730,6 +730,18 @@ bool parse_numeric_id_from_data(const json::object& data,
     return true;
 }
 
+bool parse_user_numeric_id_from_data(const json::object& data,
+                                     unsigned long long& user_numeric_id,
+                                     std::string& error_message)
+{
+    const std::string user_numeric_id_text = trim_copy(read_string_or_empty(data, "user_numeric_id"));
+    if (!parse_unsigned_long_long(user_numeric_id_text, user_numeric_id)) {
+        error_message = "field 'data.user_numeric_id' must be unsigned integer string";
+        return false;
+    }
+    return true;
+}
+
 bool parse_friend_user_id_from_data(const json::object& data,
                                     unsigned long long& friend_user_id,
                                     std::string& error_message)
@@ -737,6 +749,18 @@ bool parse_friend_user_id_from_data(const json::object& data,
     const std::string friend_user_id_text = trim_copy(read_string_or_empty(data, "friend_user_id"));
     if (!parse_unsigned_long_long(friend_user_id_text, friend_user_id)) {
         error_message = "field 'data.friend_user_id' must be unsigned integer string";
+        return false;
+    }
+    return true;
+}
+
+bool parse_friend_numeric_id_from_data(const json::object& data,
+                                       unsigned long long& friend_numeric_id,
+                                       std::string& error_message)
+{
+    const std::string friend_numeric_id_text = trim_copy(read_string_or_empty(data, "friend_numeric_id"));
+    if (!parse_unsigned_long_long(friend_numeric_id_text, friend_numeric_id)) {
+        error_message = "field 'data.friend_numeric_id' must be unsigned integer string";
         return false;
     }
     return true;
@@ -807,7 +831,7 @@ bool websocket_session::is_supported_action(const std::string& type, const std::
     }
     if (type == "PROFILE") {
         return action == "GET" || action == "GET_INFO" || action == "SET_INFO" || action == "UPDATE"
-            || action == "ADD_FRIEND" || action == "DELETE_FRIEND";
+            || action == "ADD_FRIEND" || action == "DELETE_FRIEND" || action == "LIST_FRIENDS";
     }
     if (type == "MESSAGE") {
         return action == "SEND" || action == "PULL" || action == "ACK";
@@ -1000,21 +1024,21 @@ bool websocket_session::validate_data_schema(const std::string& type,
             return true;
         }
         if (action == "ADD_FRIEND") {
-            if (!require_string_field(data, "user_id", error_message)
-                || !require_string_field(data, "friend_user_id", error_message)
+            if (!require_string_field(data, "user_numeric_id", error_message)
+                || !require_string_field(data, "friend_numeric_id", error_message)
                 || !validate_optional_string_max_len(data, "remark", 255, error_message)) {
                 error_code = protocol_code::PROFILE_VALIDATION_FAILED;
                 return false;
             }
-            unsigned long long user_id = 0;
-            unsigned long long friend_user_id = 0;
-            if (!parse_user_id_from_data(data, user_id, error_message)
-                || !parse_friend_user_id_from_data(data, friend_user_id, error_message)) {
+            unsigned long long user_numeric_id = 0;
+            unsigned long long friend_numeric_id = 0;
+            if (!parse_user_numeric_id_from_data(data, user_numeric_id, error_message)
+                || !parse_friend_numeric_id_from_data(data, friend_numeric_id, error_message)) {
                 error_code = protocol_code::PROFILE_VALIDATION_FAILED;
                 return false;
             }
-            if (user_id == friend_user_id) {
-                error_message = "field 'data.user_id' and 'data.friend_user_id' cannot be the same";
+            if (user_numeric_id == friend_numeric_id) {
+                error_message = "field 'data.user_numeric_id' and 'data.friend_numeric_id' cannot be the same";
                 error_code = protocol_code::PROFILE_VALIDATION_FAILED;
                 return false;
             }
@@ -1035,6 +1059,18 @@ bool websocket_session::validate_data_schema(const std::string& type,
             }
             if (user_id == friend_user_id) {
                 error_message = "field 'data.user_id' and 'data.friend_user_id' cannot be the same";
+                error_code = protocol_code::PROFILE_VALIDATION_FAILED;
+                return false;
+            }
+            return true;
+        }
+        if (action == "LIST_FRIENDS") {
+            if (!require_string_field(data, "numeric_id", error_message)) {
+                error_code = protocol_code::PROFILE_VALIDATION_FAILED;
+                return false;
+            }
+            unsigned long long numeric_id = 0;
+            if (!parse_numeric_id_from_data(data, numeric_id, error_message)) {
                 error_code = protocol_code::PROFILE_VALIDATION_FAILED;
                 return false;
             }
@@ -1588,18 +1624,18 @@ bool websocket_session::handle_profile_add_friend(const json::object& data,
                                                   std::string& message,
                                                   protocol_code& response_code)
 {
-    unsigned long long user_id = 0;
-    unsigned long long friend_user_id = 0;
+    unsigned long long user_numeric_id = 0;
+    unsigned long long friend_numeric_id = 0;
     std::string parse_error;
-    if (!parse_user_id_from_data(data, user_id, parse_error)
-        || !parse_friend_user_id_from_data(data, friend_user_id, parse_error)) {
+    if (!parse_user_numeric_id_from_data(data, user_numeric_id, parse_error)
+        || !parse_friend_numeric_id_from_data(data, friend_numeric_id, parse_error)) {
         response_code = protocol_code::PROFILE_VALIDATION_FAILED;
         message = parse_error;
         return false;
     }
-    if (user_id == friend_user_id) {
+    if (user_numeric_id == friend_numeric_id) {
         response_code = protocol_code::PROFILE_VALIDATION_FAILED;
-        message = "field 'data.user_id' and 'data.friend_user_id' cannot be the same";
+        message = "field 'data.user_numeric_id' and 'data.friend_numeric_id' cannot be the same";
         return false;
     }
 
@@ -1616,27 +1652,29 @@ bool websocket_session::handle_profile_add_friend(const json::object& data,
 
     std::ostringstream sql;
     sql << "START TRANSACTION; "
-        << "SELECT COUNT(*) FROM user_data WHERE id=" << user_id << "; "
-        << "SELECT COUNT(*) FROM user_data WHERE id=" << friend_user_id << "; "
+        << "SET @user_id = (SELECT id FROM user_data WHERE numeric_id=" << user_numeric_id << " LIMIT 1); "
+        << "SET @friend_user_id = (SELECT id FROM user_data WHERE numeric_id=" << friend_numeric_id << " LIMIT 1); "
+        << "SELECT IFNULL(@user_id, 0); "
+        << "SELECT IFNULL(@friend_user_id, 0); "
         << "SELECT COUNT(*) FROM friendships "
-        << "WHERE ((user_id=" << user_id << " AND friend_user_id=" << friend_user_id << ") "
-        << "OR (user_id=" << friend_user_id << " AND friend_user_id=" << user_id << ")) "
+        << "WHERE ((user_id=@user_id AND friend_user_id=@friend_user_id) "
+        << "OR (user_id=@friend_user_id AND friend_user_id=@user_id)) "
         << "AND status=2; "
         << "INSERT INTO friendships (user_id, friend_user_id, status, remark) "
-        << "SELECT " << user_id << ", " << friend_user_id << ", 1, '" << sql_escape(remark) << "' "
-        << "FROM DUAL WHERE EXISTS(SELECT 1 FROM user_data WHERE id=" << user_id << ") "
-        << "AND EXISTS(SELECT 1 FROM user_data WHERE id=" << friend_user_id << ") "
+        << "SELECT @user_id, @friend_user_id, 1, '" << sql_escape(remark) << "' "
+        << "FROM DUAL WHERE @user_id IS NOT NULL "
+        << "AND @friend_user_id IS NOT NULL "
         << "AND NOT EXISTS(SELECT 1 FROM friendships "
-        << "WHERE ((user_id=" << user_id << " AND friend_user_id=" << friend_user_id << ") "
-        << "OR (user_id=" << friend_user_id << " AND friend_user_id=" << user_id << ")) AND status=2) "
+        << "WHERE ((user_id=@user_id AND friend_user_id=@friend_user_id) "
+        << "OR (user_id=@friend_user_id AND friend_user_id=@user_id)) AND status=2) "
         << "ON DUPLICATE KEY UPDATE status=1, remark=VALUES(remark); "
         << "INSERT INTO friendships (user_id, friend_user_id, status, remark) "
-        << "SELECT " << friend_user_id << ", " << user_id << ", 1, '' "
-        << "FROM DUAL WHERE EXISTS(SELECT 1 FROM user_data WHERE id=" << user_id << ") "
-        << "AND EXISTS(SELECT 1 FROM user_data WHERE id=" << friend_user_id << ") "
+        << "SELECT @friend_user_id, @user_id, 1, '' "
+        << "FROM DUAL WHERE @user_id IS NOT NULL "
+        << "AND @friend_user_id IS NOT NULL "
         << "AND NOT EXISTS(SELECT 1 FROM friendships "
-        << "WHERE ((user_id=" << user_id << " AND friend_user_id=" << friend_user_id << ") "
-        << "OR (user_id=" << friend_user_id << " AND friend_user_id=" << user_id << ")) AND status=2) "
+        << "WHERE ((user_id=@user_id AND friend_user_id=@friend_user_id) "
+        << "OR (user_id=@friend_user_id AND friend_user_id=@user_id)) AND status=2) "
         << "ON DUPLICATE KEY UPDATE status=1; "
         << "COMMIT;";
 
@@ -1658,11 +1696,11 @@ bool websocket_session::handle_profile_add_friend(const json::object& data,
         return false;
     }
 
-    unsigned long long user_exists = 0;
-    unsigned long long friend_exists = 0;
+    unsigned long long user_id = 0;
+    unsigned long long friend_user_id = 0;
     unsigned long long blocked_count = 0;
-    if (!parse_unsigned_long_long(trim_copy(lines[0]), user_exists)
-        || !parse_unsigned_long_long(trim_copy(lines[1]), friend_exists)
+    if (!parse_unsigned_long_long(trim_copy(lines[0]), user_id)
+        || !parse_unsigned_long_long(trim_copy(lines[1]), friend_user_id)
         || !parse_unsigned_long_long(trim_copy(lines[2]), blocked_count)) {
         response_code = protocol_code::INTERNAL_ERROR;
         message = "add friend failed: unexpected database output";
@@ -1670,7 +1708,7 @@ bool websocket_session::handle_profile_add_friend(const json::object& data,
         return false;
     }
 
-    if (user_exists == 0 || friend_exists == 0) {
+    if (user_id == 0 || friend_user_id == 0) {
         response_code = protocol_code::PROFILE_NOT_FOUND;
         message = "user not found";
         return false;
@@ -1684,9 +1722,130 @@ bool websocket_session::handle_profile_add_friend(const json::object& data,
 
     response_data["user_id"] = std::to_string(user_id);
     response_data["friend_user_id"] = std::to_string(friend_user_id);
+    response_data["user_numeric_id"] = std::to_string(user_numeric_id);
+    response_data["friend_numeric_id"] = std::to_string(friend_numeric_id);
     response_data["status"] = 1;
     response_code = protocol_code::OK;
     message = "friend added";
+    return true;
+}
+
+bool websocket_session::handle_profile_list_friends(const json::object& data,
+                                                    json::object& response_data,
+                                                    std::string& message,
+                                                    protocol_code& response_code)
+{
+    unsigned long long requester_numeric_id = 0;
+    std::string parse_error;
+    if (!parse_numeric_id_from_data(data, requester_numeric_id, parse_error)) {
+        response_code = protocol_code::PROFILE_VALIDATION_FAILED;
+        message = parse_error;
+        return false;
+    }
+
+    const mysql_config cfg = load_mysql_config();
+    response_data["debug"] = build_mysql_config_debug(cfg);
+    std::string config_error;
+    if (!is_mysql_config_valid(cfg, config_error)) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "list friends failed: database config missing";
+        response_data["debug"].as_object()["config_error"] = config_error;
+        return false;
+    }
+
+    std::ostringstream sql;
+    sql << "SET @user_id = (SELECT id FROM user_data WHERE numeric_id=" << requester_numeric_id << " LIMIT 1); "
+        << "SELECT IFNULL(@user_id, 0); "
+        << "SELECT "
+        << "u.id, "
+        << "COALESCE(u.numeric_id, 0), "
+        << "u.username, "
+        << "u.status, "
+        << "COALESCE(p.nickname, ''), "
+        << "COALESCE(p.avatar_url, ''), "
+        << "COALESCE(p.bio, '') "
+        << "FROM friendships f "
+        << "JOIN user_data u ON u.id=f.friend_user_id "
+        << "LEFT JOIN user_im_profile p ON p.user_id=u.id AND p.deleted_at IS NULL "
+        << "WHERE f.user_id=@user_id AND f.status=1 "
+        << "ORDER BY u.id ASC;";
+
+    std::string command_output;
+    int exit_code = 0;
+    if (!run_mysql_sql(cfg, sql.str(), command_output, exit_code)) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "list friends failed in database";
+        response_data["debug"].as_object()["mysql_exit_code"] = exit_code;
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    const std::vector<std::string> lines = collect_non_empty_lines(command_output);
+    if (lines.empty()) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "list friends failed: unexpected database output";
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    unsigned long long requester_user_id = 0;
+    if (!parse_unsigned_long_long(trim_copy(lines[0]), requester_user_id)) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "list friends failed: unexpected database output";
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+    if (requester_user_id == 0ULL) {
+        response_code = protocol_code::PROFILE_NOT_FOUND;
+        message = "user not found";
+        return false;
+    }
+
+    json::array friends;
+    for (std::size_t i = 1; i < lines.size(); ++i) {
+        const std::vector<std::string> cols = split_by_tab(lines[i]);
+        if (cols.size() < 7U) {
+            response_code = protocol_code::INTERNAL_ERROR;
+            message = "list friends failed: unexpected database output";
+            response_data["debug"].as_object()["mysql_output"] = command_output;
+            return false;
+        }
+        unsigned long long friend_user_id = 0;
+        unsigned long long friend_numeric_id = 0;
+        unsigned long long status = 0;
+        if (!parse_unsigned_long_long(cols[0], friend_user_id)
+            || !parse_unsigned_long_long(cols[1], friend_numeric_id)
+            || !parse_unsigned_long_long(cols[3], status)) {
+            response_code = protocol_code::INTERNAL_ERROR;
+            message = "list friends failed: unexpected database output";
+            response_data["debug"].as_object()["mysql_output"] = command_output;
+            return false;
+        }
+        unsigned int expected_numeric_id = 0U;
+        if (!build_numeric_user_id(friend_user_id, expected_numeric_id)
+            || friend_numeric_id != static_cast<unsigned long long>(expected_numeric_id)) {
+            response_code = protocol_code::INTERNAL_ERROR;
+            message = "list friends failed: inconsistent user identity in database";
+            response_data["debug"].as_object()["mysql_output"] = command_output;
+            return false;
+        }
+
+        json::object item;
+        item["user_id"] = std::to_string(friend_user_id);
+        item["numeric_id"] = std::to_string(friend_numeric_id);
+        item["username"] = (cols[2] == "\\N") ? "" : cols[2];
+        item["status"] = static_cast<int>(status);
+        item["nickname"] = (cols[4] == "\\N") ? "" : cols[4];
+        item["avatar_url"] = (cols[5] == "\\N") ? "" : cols[5];
+        item["bio"] = (cols[6] == "\\N") ? "" : cols[6];
+        friends.push_back(std::move(item));
+    }
+
+    response_data["numeric_id"] = std::to_string(requester_numeric_id);
+    response_data["user_id"] = std::to_string(requester_user_id);
+    response_data["friends"] = std::move(friends);
+    response_code = protocol_code::OK;
+    message = "friend list request accepted";
     return true;
 }
 
@@ -1964,6 +2123,8 @@ void websocket_session::on_read(
             ok = handle_profile_set_info(request.data, response_data, message, response_code);
         } else if (request.type == "PROFILE" && request.action == "ADD_FRIEND") {
             ok = handle_profile_add_friend(request.data, response_data, message, response_code);
+        } else if (request.type == "PROFILE" && request.action == "LIST_FRIENDS") {
+            ok = handle_profile_list_friends(request.data, response_data, message, response_code);
         } else if (request.type == "PROFILE" && request.action == "DELETE_FRIEND") {
             ok = handle_profile_delete_friend(request.data, response_data, message, response_code);
         } else {
