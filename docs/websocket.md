@@ -55,10 +55,45 @@
 }
 ```
 
+成功响应会返回：
+```json
+{
+  "user": {
+    "user_id": "string",
+    "numeric_id": "string",
+    "username": "string",
+    "email": "string",
+    "phone": "string",
+    "status": 1,
+    "user_uuid": "string",
+    "nickname": "string",
+    "avatar_url": "string",
+    "bio": "string"
+  },
+  "upload_token": "string",
+  "upload_token_expires_at": "string",
+  "upload_token_type": "Bearer",
+  "presence": {
+    "is_online": true,
+    "last_seen_at": "UTC ISO8601"
+  }
+}
+```
+
 2. `action = LOGOUT`
 ```json
 {
   "token": "string"
+}
+```
+
+成功响应会返回：
+```json
+{
+  "user_id": "string",
+  "numeric_id": "string",
+  "offline": true,
+  "last_seen_at": "UTC ISO8601"
 }
 ```
 
@@ -180,8 +215,20 @@
 6. `action = DELETE_FRIEND`
 ```json
 {
-  "user_id": "string, 必填，无符号整数字符串",
-  "friend_user_id": "string, 必填，无符号整数字符串"
+  "user_numeric_id": "string, 必填，无符号整数字符串",
+  "friend_numeric_id": "string, 必填，无符号整数字符串"
+}
+```
+
+成功响应会返回：
+```json
+{
+  "user_numeric_id": "string",
+  "friend_numeric_id": "string",
+  "user_id": "string",
+  "friend_user_id": "string",
+  "deleted_rows": 2,
+  "removed": true
 }
 ```
 
@@ -203,20 +250,14 @@
       "numeric_id": "string",
       "username": "string",
       "status": 1,
+      "user_status": 1,
+      "is_online": true,
+      "last_seen_at": "UTC ISO8601",
       "nickname": "string",
       "avatar_url": "string",
       "bio": "string"
     }
   ]
-}
-```
-
-成功响应会返回：
-```json
-{
-  "user_id": "string",
-  "friend_user_id": "string",
-  "removed": true
 }
 ```
 
@@ -288,8 +329,10 @@
 - `PROFILE/GET_INFO` 会从 `user_im_profile` 读取资料（含 `extra.signature/extra.theme`）
 - `PROFILE/SET_INFO` 会更新 `user_im_profile.nickname/avatar_url/extra.signature/extra.theme`
 - `PROFILE/ADD_FRIEND` 接收 `user_numeric_id/friend_numeric_id`，服务端先映射 `user_id` 再写入 `friendships` 双向关系（`status=1`）
-- `PROFILE/DELETE_FRIEND` 会删除 `friendships` 双向关系（幂等）
-- `PROFILE/LIST_FRIENDS` 会按 `data.numeric_id` 返回该用户的好友列表 `data.friends`
+- `PROFILE/DELETE_FRIEND` 接收 `user_numeric_id/friend_numeric_id`，服务端先映射 `user_id` 再删除 `friendships` 双向关系（幂等）
+- `AUTH/LOGIN` 成功后会将 `user_im_profile.is_online` 置为 `1`
+- `AUTH/LOGOUT` 成功后会将当前连接对应用户置为离线；若连接异常关闭，服务端也会兜底离线
+- `PROFILE/LIST_FRIENDS` 会按 `data.numeric_id` 返回该用户的好友列表 `data.friends`，其中 `status/user_status` 为账号状态，`is_online/last_seen_at` 为在线状态
 - 请求失败：`code != 0`，`data.ok = false`，`data.message` 给出原因，可能附带 `data.received_payload`
 
 说明：服务端将 `password` 转为 `password_hash` 后再入库，当前实现为 `PBKDF2-HMAC-SHA256`（随机盐 + 高迭代），满足生产可用的基础密码存储要求。

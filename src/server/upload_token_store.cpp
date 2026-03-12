@@ -88,16 +88,13 @@ bool issue_upload_token(unsigned long long user_id,
 }
 
 bool validate_upload_token(const std::string& token,
-                           unsigned long long expected_user_id,
+                           unsigned long long& out_user_id,
                            std::string& error_message)
 {
     error_message.clear();
+    out_user_id = 0ULL;
     if (token.empty()) {
         error_message = "missing bearer token";
-        return false;
-    }
-    if (expected_user_id == 0ULL) {
-        error_message = "invalid user id";
         return false;
     }
 
@@ -115,10 +112,7 @@ bool validate_upload_token(const std::string& token,
         error_message = "token expired";
         return false;
     }
-    if (it->second.user_id != expected_user_id) {
-        error_message = "token does not match user_id";
-        return false;
-    }
+    out_user_id = it->second.user_id;
     return true;
 }
 

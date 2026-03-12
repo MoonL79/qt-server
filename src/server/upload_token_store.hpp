@@ -12,7 +12,7 @@ bool issue_upload_token(unsigned long long user_id,
                         std::string& out_expires_at_utc);
 
 bool validate_upload_token(const std::string& token,
-                           unsigned long long expected_user_id,
+                           unsigned long long& out_user_id,
                            std::string& error_message);
 
 } // namespace server
