@@ -11,8 +11,10 @@
 #include <iomanip>
 #include <fstream>
 #include <limits>
+#include <mutex>
 #include <random>
 #include <sstream>
+#include <unordered_map>
 #include <vector>
 #if !defined(_WIN32)
 #include <sys/wait.h>
@@ -23,6 +25,9 @@ namespace server {
 
 namespace {
 
+std::mutex g_presence_mutex;
+std::unordered_map<unsigned long long, std::size_t> g_online_session_counts;
+
 struct mysql_config
 {
     std::string host;
@@ -31,6 +36,8 @@ struct mysql_config
     std::string user;
     std::string password;
 };
+
+json::object build_mysql_config_debug(const mysql_config& cfg);
 
 std::string mask_secret(const std::string& value)
 {
@@ -791,6 +798,50 @@ bool is_mysql_config_valid(const mysql_config& cfg, std::string& reason)
     return true;
 }
 
+bool update_user_presence_in_db(const mysql_config& cfg,
+                                unsigned long long user_id,
+                                bool is_online,
+                                std::string& command_output,
+                                int& exit_code)
+{
+    std::ostringstream sql;
+    sql << "UPDATE user_im_profile SET is_online=" << (is_online ? 1 : 0)
+        << ", last_seen_at=NOW(), updated_at=NOW() "
+        << "WHERE user_id=" << user_id << " AND deleted_at IS NULL;";
+    return run_mysql_sql(cfg, sql.str(), command_output, exit_code);
+}
+
+bool mark_user_presence(unsigned long long user_id,
+                        bool is_online,
+                        json::object* response_data)
+{
+    if (user_id == 0ULL) {
+        return false;
+    }
+
+    const mysql_config cfg = load_mysql_config();
+    std::string config_error;
+    if (!is_mysql_config_valid(cfg, config_error)) {
+        if (response_data != nullptr) {
+            (*response_data)["debug"] = build_mysql_config_debug(cfg);
+            (*response_data)["debug"].as_object()["config_error"] = config_error;
+        }
+        return false;
+    }
+
+    std::string command_output;
+    int exit_code = 0;
+    if (!update_user_presence_in_db(cfg, user_id, is_online, command_output, exit_code)) {
+        if (response_data != nullptr) {
+            (*response_data)["debug"] = build_mysql_config_debug(cfg);
+            (*response_data)["debug"].as_object()["mysql_exit_code"] = exit_code;
+            (*response_data)["debug"].as_object()["mysql_output"] = command_output;
+        }
+        return false;
+    }
+    return true;
+}
+
 json::object build_mysql_config_debug(const mysql_config& cfg)
 {
     json::object debug;
@@ -1045,20 +1096,20 @@ bool websocket_session::validate_data_schema(const std::string& type,
             return true;
         }
         if (action == "DELETE_FRIEND") {
-            if (!require_string_field(data, "user_id", error_message)
-                || !require_string_field(data, "friend_user_id", error_message)) {
+            if (!require_string_field(data, "user_numeric_id", error_message)
+                || !require_string_field(data, "friend_numeric_id", error_message)) {
                 error_code = protocol_code::PROFILE_VALIDATION_FAILED;
                 return false;
             }
-            unsigned long long user_id = 0;
-            unsigned long long friend_user_id = 0;
-            if (!parse_user_id_from_data(data, user_id, error_message)
-                || !parse_friend_user_id_from_data(data, friend_user_id, error_message)) {
+            unsigned long long user_numeric_id = 0;
+            unsigned long long friend_numeric_id = 0;
+            if (!parse_user_numeric_id_from_data(data, user_numeric_id, error_message)
+                || !parse_friend_numeric_id_from_data(data, friend_numeric_id, error_message)) {
                 error_code = protocol_code::PROFILE_VALIDATION_FAILED;
                 return false;
             }
-            if (user_id == friend_user_id) {
-                error_message = "field 'data.user_id' and 'data.friend_user_id' cannot be the same";
+            if (user_numeric_id == friend_numeric_id) {
+                error_message = "field 'data.user_numeric_id' and 'data.friend_numeric_id' cannot be the same";
                 error_code = protocol_code::PROFILE_VALIDATION_FAILED;
                 return false;
             }
@@ -1231,6 +1282,9 @@ bool websocket_session::handle_login(const json::object& data,
 {
     const std::string username = trim_copy(read_string_or_empty(data, "username"));
     const std::string plain_password = read_string_or_empty(data, "password");
+    std::cout << "[presence] login request session=" << static_cast<const void*>(this)
+              << " remote=" << remote_endpoint_
+              << " username=" << username << std::endl;
 
     const mysql_config cfg = load_mysql_config();
     response_data["debug"] = build_mysql_config_debug(cfg);
@@ -1245,6 +1299,7 @@ bool websocket_session::handle_login(const json::object& data,
     std::ostringstream sql;
     sql << "SELECT "
         << "u.id, "
+        << "COALESCE(u.numeric_id, 0), "
         << "u.username, "
         << "u.email, "
         << "COALESCE(u.phone, ''), "
@@ -1277,7 +1332,7 @@ bool websocket_session::handle_login(const json::object& data,
     }
 
     const std::vector<std::string> cols = split_by_tab(lines.back());
-    if (cols.size() < 10U) {
+    if (cols.size() < 11U) {
         response_code = protocol_code::LOGIN_FAILED;
         message = "invalid username or password";
         response_data["debug"].as_object()["mysql_output"] = command_output;
@@ -1285,14 +1340,17 @@ bool websocket_session::handle_login(const json::object& data,
     }
 
     unsigned long long user_id = 0;
+    unsigned long long numeric_id = 0;
     unsigned long long status = 0;
-    if (!parse_unsigned_long_long(cols[0], user_id) || !parse_unsigned_long_long(cols[4], status)) {
+    if (!parse_unsigned_long_long(cols[0], user_id)
+        || !parse_unsigned_long_long(cols[1], numeric_id)
+        || !parse_unsigned_long_long(cols[5], status)) {
         response_code = protocol_code::LOGIN_FAILED;
         message = "invalid username or password";
         return false;
     }
 
-    const std::string password_hash = cols[5];
+    const std::string password_hash = cols[6];
     if (!verify_password_against_storage(plain_password, password_hash)) {
         response_code = protocol_code::LOGIN_FAILED;
         message = "invalid username or password";
@@ -1306,9 +1364,7 @@ bool websocket_session::handle_login(const json::object& data,
     }
 
     std::ostringstream update_sql;
-    update_sql << "UPDATE user_data SET last_login_at=NOW(), updated_at=NOW() WHERE id=" << user_id << "; "
-               << "UPDATE user_im_profile SET is_online=1, last_seen_at=NOW(), updated_at=NOW() "
-               << "WHERE user_id=" << user_id << " AND deleted_at IS NULL;";
+    update_sql << "UPDATE user_data SET last_login_at=NOW(), updated_at=NOW() WHERE id=" << user_id << ";";
     std::string update_output;
     int update_exit_code = 0;
     if (!run_mysql_sql(cfg, update_sql.str(), update_output, update_exit_code)) {
@@ -1318,14 +1374,15 @@ bool websocket_session::handle_login(const json::object& data,
 
     json::object user_data;
     user_data["user_id"] = std::to_string(user_id);
-    user_data["username"] = (cols[1] == "\\N") ? "" : cols[1];
-    user_data["email"] = (cols[2] == "\\N") ? "" : cols[2];
-    user_data["phone"] = (cols[3] == "\\N") ? "" : cols[3];
+    user_data["numeric_id"] = std::to_string(numeric_id);
+    user_data["username"] = (cols[2] == "\\N") ? "" : cols[2];
+    user_data["email"] = (cols[3] == "\\N") ? "" : cols[3];
+    user_data["phone"] = (cols[4] == "\\N") ? "" : cols[4];
     user_data["status"] = static_cast<int>(status);
-    user_data["user_uuid"] = (cols[6] == "\\N") ? "" : cols[6];
-    user_data["nickname"] = (cols[7] == "\\N") ? "" : cols[7];
-    user_data["avatar_url"] = (cols[8] == "\\N") ? "" : cols[8];
-    user_data["bio"] = (cols[9] == "\\N") ? "" : cols[9];
+    user_data["user_uuid"] = (cols[7] == "\\N") ? "" : cols[7];
+    user_data["nickname"] = (cols[8] == "\\N") ? "" : cols[8];
+    user_data["avatar_url"] = (cols[9] == "\\N") ? "" : cols[9];
+    user_data["bio"] = (cols[10] == "\\N") ? "" : cols[10];
     response_data["user"] = std::move(user_data);
 
     std::string upload_token;
@@ -1340,8 +1397,77 @@ bool websocket_session::handle_login(const json::object& data,
         response_data["upload_token_type"] = "Bearer";
     }
 
+    bind_authenticated_user(user_id, numeric_id, username, &response_data);
+    response_data["presence"] = json::object{
+        {"is_online", true},
+        {"last_seen_at", now_utc_iso8601()}
+    };
+    std::cout << "[presence] login accepted session=" << static_cast<const void*>(this)
+              << " remote=" << remote_endpoint_
+              << " user_id=" << user_id
+              << " numeric_id=" << numeric_id
+              << " username=" << username << std::endl;
+
     response_code = protocol_code::OK;
     message = "login accepted";
+    return true;
+}
+
+bool websocket_session::handle_logout(const json::object& data,
+                                      json::object& response_data,
+                                      std::string& message,
+                                      protocol_code& response_code)
+{
+    const std::string token = trim_copy(read_string_or_empty(data, "token"));
+    unsigned long long token_user_id = 0;
+    std::string token_error;
+    std::cout << "[presence] logout request session=" << static_cast<const void*>(this)
+              << " remote=" << remote_endpoint_
+              << " token_len=" << token.size()
+              << " bound_user_id=" << authenticated_user_id_
+              << std::endl;
+    if (!validate_upload_token(token, token_user_id, token_error)) {
+        response_code = protocol_code::TOKEN_INVALID;
+        message = token_error;
+        std::cout << "[presence] logout token validation failed session=" << static_cast<const void*>(this)
+                  << " remote=" << remote_endpoint_
+                  << " error=" << token_error << std::endl;
+        return false;
+    }
+
+    response_data["user_id"] = std::to_string(token_user_id);
+    if (authenticated_user_id_ == token_user_id) {
+        response_data["numeric_id"] = std::to_string(authenticated_numeric_id_);
+    } else {
+        unsigned int numeric_id = 0U;
+        if (build_numeric_user_id(token_user_id, numeric_id)) {
+            response_data["numeric_id"] = std::to_string(numeric_id);
+        } else {
+            response_data["numeric_id"] = "";
+        }
+    }
+    response_data["offline"] = true;
+    response_data["last_seen_at"] = now_utc_iso8601();
+    if (authenticated_user_id_ == token_user_id) {
+        unbind_authenticated_user(true, &response_data);
+    } else {
+        std::cout << "[presence] logout token user does not match bound session, forcing offline by token"
+                  << " session=" << static_cast<const void*>(this)
+                  << " remote=" << remote_endpoint_
+                  << " token_user_id=" << token_user_id
+                  << " bound_user_id=" << authenticated_user_id_
+                  << std::endl;
+        if (!mark_user_presence(token_user_id, false, &response_data)) {
+            response_data["presence_sync_failed"] = true;
+        }
+        response_data["presence_event"] = "logout";
+    }
+    std::cout << "[presence] logout accepted session=" << static_cast<const void*>(this)
+              << " remote=" << remote_endpoint_
+              << " token_user_id=" << token_user_id
+              << " response_offline=true" << std::endl;
+    response_code = protocol_code::OK;
+    message = "logout accepted";
     return true;
 }
 
@@ -1761,6 +1887,8 @@ bool websocket_session::handle_profile_list_friends(const json::object& data,
         << "COALESCE(u.numeric_id, 0), "
         << "u.username, "
         << "u.status, "
+        << "COALESCE(p.is_online, 0), "
+        << "COALESCE(DATE_FORMAT(p.last_seen_at, '%Y-%m-%dT%H:%i:%sZ'), ''), "
         << "COALESCE(p.nickname, ''), "
         << "COALESCE(p.avatar_url, ''), "
         << "COALESCE(p.bio, '') "
@@ -1804,7 +1932,7 @@ bool websocket_session::handle_profile_list_friends(const json::object& data,
     json::array friends;
     for (std::size_t i = 1; i < lines.size(); ++i) {
         const std::vector<std::string> cols = split_by_tab(lines[i]);
-        if (cols.size() < 7U) {
+        if (cols.size() < 9U) {
             response_code = protocol_code::INTERNAL_ERROR;
             message = "list friends failed: unexpected database output";
             response_data["debug"].as_object()["mysql_output"] = command_output;
@@ -1812,10 +1940,12 @@ bool websocket_session::handle_profile_list_friends(const json::object& data,
         }
         unsigned long long friend_user_id = 0;
         unsigned long long friend_numeric_id = 0;
-        unsigned long long status = 0;
+        unsigned long long user_status = 0;
+        unsigned long long is_online = 0;
         if (!parse_unsigned_long_long(cols[0], friend_user_id)
             || !parse_unsigned_long_long(cols[1], friend_numeric_id)
-            || !parse_unsigned_long_long(cols[3], status)) {
+            || !parse_unsigned_long_long(cols[3], user_status)
+            || !parse_unsigned_long_long(cols[4], is_online)) {
             response_code = protocol_code::INTERNAL_ERROR;
             message = "list friends failed: unexpected database output";
             response_data["debug"].as_object()["mysql_output"] = command_output;
@@ -1834,10 +1964,13 @@ bool websocket_session::handle_profile_list_friends(const json::object& data,
         item["user_id"] = std::to_string(friend_user_id);
         item["numeric_id"] = std::to_string(friend_numeric_id);
         item["username"] = (cols[2] == "\\N") ? "" : cols[2];
-        item["status"] = static_cast<int>(status);
-        item["nickname"] = (cols[4] == "\\N") ? "" : cols[4];
-        item["avatar_url"] = (cols[5] == "\\N") ? "" : cols[5];
-        item["bio"] = (cols[6] == "\\N") ? "" : cols[6];
+        item["status"] = static_cast<int>(user_status);
+        item["user_status"] = static_cast<int>(user_status);
+        item["is_online"] = (is_online != 0ULL);
+        item["last_seen_at"] = (cols[5] == "\\N") ? "" : cols[5];
+        item["nickname"] = (cols[6] == "\\N") ? "" : cols[6];
+        item["avatar_url"] = (cols[7] == "\\N") ? "" : cols[7];
+        item["bio"] = (cols[8] == "\\N") ? "" : cols[8];
         friends.push_back(std::move(item));
     }
 
@@ -1854,18 +1987,18 @@ bool websocket_session::handle_profile_delete_friend(const json::object& data,
                                                      std::string& message,
                                                      protocol_code& response_code)
 {
-    unsigned long long user_id = 0;
-    unsigned long long friend_user_id = 0;
+    unsigned long long user_numeric_id = 0;
+    unsigned long long friend_numeric_id = 0;
     std::string parse_error;
-    if (!parse_user_id_from_data(data, user_id, parse_error)
-        || !parse_friend_user_id_from_data(data, friend_user_id, parse_error)) {
+    if (!parse_user_numeric_id_from_data(data, user_numeric_id, parse_error)
+        || !parse_friend_numeric_id_from_data(data, friend_numeric_id, parse_error)) {
         response_code = protocol_code::PROFILE_VALIDATION_FAILED;
         message = parse_error;
         return false;
     }
-    if (user_id == friend_user_id) {
+    if (user_numeric_id == friend_numeric_id) {
         response_code = protocol_code::PROFILE_VALIDATION_FAILED;
-        message = "field 'data.user_id' and 'data.friend_user_id' cannot be the same";
+        message = "field 'data.user_numeric_id' and 'data.friend_numeric_id' cannot be the same";
         return false;
     }
 
@@ -1881,9 +2014,14 @@ bool websocket_session::handle_profile_delete_friend(const json::object& data,
 
     std::ostringstream sql;
     sql << "START TRANSACTION; "
+        << "SET @user_id = (SELECT id FROM user_data WHERE numeric_id=" << user_numeric_id << " LIMIT 1); "
+        << "SET @friend_user_id = (SELECT id FROM user_data WHERE numeric_id=" << friend_numeric_id << " LIMIT 1); "
+        << "SELECT IFNULL(@user_id, 0); "
+        << "SELECT IFNULL(@friend_user_id, 0); "
         << "DELETE FROM friendships "
-        << "WHERE (user_id=" << user_id << " AND friend_user_id=" << friend_user_id << ") "
-        << "OR (user_id=" << friend_user_id << " AND friend_user_id=" << user_id << "); "
+        << "WHERE (@user_id IS NOT NULL AND @friend_user_id IS NOT NULL) "
+        << "AND ((user_id=@user_id AND friend_user_id=@friend_user_id) "
+        << "OR (user_id=@friend_user_id AND friend_user_id=@user_id)); "
         << "SELECT ROW_COUNT(); "
         << "COMMIT;";
 
@@ -1892,14 +2030,44 @@ bool websocket_session::handle_profile_delete_friend(const json::object& data,
     if (!run_mysql_sql(cfg, sql.str(), command_output, exit_code)) {
         response_code = protocol_code::INTERNAL_ERROR;
         message = "delete friend failed in database";
+        response_data["debug"] = build_mysql_config_debug(cfg);
         response_data["debug"].as_object()["mysql_exit_code"] = exit_code;
         response_data["debug"].as_object()["mysql_output"] = command_output;
         return false;
     }
 
+    const std::vector<std::string> lines = collect_non_empty_lines(command_output);
+    if (lines.size() < 3U) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "delete friend failed: unexpected database output";
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    unsigned long long user_id = 0;
+    unsigned long long friend_user_id = 0;
+    unsigned long long deleted_rows = 0;
+    if (!parse_unsigned_long_long(trim_copy(lines[0]), user_id)
+        || !parse_unsigned_long_long(trim_copy(lines[1]), friend_user_id)
+        || !parse_unsigned_long_long(trim_copy(lines[2]), deleted_rows)) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "delete friend failed: unexpected database output";
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    if (user_id == 0ULL || friend_user_id == 0ULL) {
+        response_code = protocol_code::PROFILE_NOT_FOUND;
+        message = "user not found";
+        return false;
+    }
+
     response_data["user_id"] = std::to_string(user_id);
     response_data["friend_user_id"] = std::to_string(friend_user_id);
-    response_data["removed"] = true;
+    response_data["user_numeric_id"] = std::to_string(user_numeric_id);
+    response_data["friend_numeric_id"] = std::to_string(friend_numeric_id);
+    response_data["deleted_rows"] = static_cast<std::uint64_t>(deleted_rows);
+    response_data["removed"] = (deleted_rows > 0ULL);
     response_code = protocol_code::OK;
     message = "friend deleted";
     return true;
@@ -2009,6 +2177,119 @@ std::string websocket_session::build_response_payload(const std::string& type,
     return json::serialize(response);
 }
 
+void websocket_session::bind_authenticated_user(std::uint64_t user_id,
+                                                std::uint64_t numeric_id,
+                                                const std::string& username,
+                                                json::object* response_data)
+{
+    if (authenticated_user_id_ == user_id && authenticated_user_id_ != 0ULL) {
+        std::cout << "[presence] bind skip same user session=" << static_cast<const void*>(this)
+                  << " remote=" << remote_endpoint_
+                  << " user_id=" << user_id
+                  << " numeric_id=" << numeric_id << std::endl;
+        authenticated_numeric_id_ = numeric_id;
+        authenticated_username_ = username;
+        return;
+    }
+
+    if (authenticated_user_id_ != 0ULL && authenticated_user_id_ != user_id) {
+        unbind_authenticated_user(false, response_data);
+    }
+
+    bool should_mark_online = false;
+    std::size_t old_count = 0U;
+    std::size_t new_count = 0U;
+    {
+        std::lock_guard<std::mutex> lock(g_presence_mutex);
+        std::size_t& count = g_online_session_counts[user_id];
+        old_count = count;
+        should_mark_online = (count == 0U);
+        ++count;
+        new_count = count;
+    }
+
+    authenticated_user_id_ = user_id;
+    authenticated_numeric_id_ = numeric_id;
+    authenticated_username_ = username;
+
+    std::cout << "[presence] bind session=" << static_cast<const void*>(this)
+              << " remote=" << remote_endpoint_
+              << " user_id=" << user_id
+              << " numeric_id=" << numeric_id
+              << " old_count=" << old_count
+              << " new_count=" << new_count
+              << " should_mark_online=" << (should_mark_online ? "true" : "false")
+              << std::endl;
+
+    if (should_mark_online && !mark_user_presence(user_id, true, response_data) && response_data != nullptr) {
+        (*response_data)["presence_sync_failed"] = true;
+        std::cout << "[presence] bind mark online failed session=" << static_cast<const void*>(this)
+                  << " remote=" << remote_endpoint_
+                  << " user_id=" << user_id << std::endl;
+    }
+}
+
+void websocket_session::unbind_authenticated_user(bool explicit_logout,
+                                                  json::object* response_data)
+{
+    if (authenticated_user_id_ == 0ULL) {
+        std::cout << "[presence] unbind skipped empty session=" << static_cast<const void*>(this)
+                  << " remote=" << remote_endpoint_
+                  << " explicit_logout=" << (explicit_logout ? "true" : "false")
+                  << std::endl;
+        return;
+    }
+
+    const std::uint64_t user_id = authenticated_user_id_;
+    bool should_mark_offline = false;
+    std::size_t old_count = 0U;
+    std::size_t new_count = 0U;
+    {
+        std::lock_guard<std::mutex> lock(g_presence_mutex);
+        const auto it = g_online_session_counts.find(user_id);
+        if (it != g_online_session_counts.end()) {
+            old_count = it->second;
+            if (it->second > 1U) {
+                --it->second;
+                new_count = it->second;
+            } else {
+                g_online_session_counts.erase(it);
+                should_mark_offline = true;
+                new_count = 0U;
+            }
+        } else {
+            should_mark_offline = true;
+            old_count = 0U;
+            new_count = 0U;
+        }
+    }
+
+    std::cout << "[presence] unbind session=" << static_cast<const void*>(this)
+              << " remote=" << remote_endpoint_
+              << " user_id=" << user_id
+              << " numeric_id=" << authenticated_numeric_id_
+              << " explicit_logout=" << (explicit_logout ? "true" : "false")
+              << " old_count=" << old_count
+              << " new_count=" << new_count
+              << " should_mark_offline=" << (should_mark_offline ? "true" : "false")
+              << std::endl;
+
+    authenticated_user_id_ = 0ULL;
+    authenticated_numeric_id_ = 0ULL;
+    authenticated_username_.clear();
+
+    if (should_mark_offline && !mark_user_presence(user_id, false, response_data) && response_data != nullptr) {
+        (*response_data)["presence_sync_failed"] = true;
+        std::cout << "[presence] unbind mark offline failed session=" << static_cast<const void*>(this)
+                  << " remote=" << remote_endpoint_
+                  << " user_id=" << user_id << std::endl;
+    }
+
+    if (explicit_logout && response_data != nullptr) {
+        (*response_data)["presence_event"] = "logout";
+    }
+}
+
 websocket_session::websocket_session(tcp::socket socket)
     : ws_(std::move(socket))
 {
@@ -2016,6 +2297,8 @@ websocket_session::websocket_session(tcp::socket socket)
         auto endpoint = ws_.next_layer().remote_endpoint();
         remote_endpoint_ = endpoint.address().to_string() + ":" + std::to_string(endpoint.port());
         std::cout << "WebSocket session created for " << remote_endpoint_ << std::endl;
+        std::cout << "[presence] session created session=" << static_cast<const void*>(this)
+                  << " remote=" << remote_endpoint_ << std::endl;
     } catch (const boost::system::system_error& e) {
         std::cout << "WebSocket session can't create with a unavailable remote endpoint: " << e.what() << std::endl;
     } catch (const std::exception& e) {
@@ -2075,11 +2358,20 @@ void websocket_session::on_read(
     boost::ignore_unused(bytes_transferred);
 
     // This indicates that the websocket_session was closed
-    if(ec == websocket::error::closed)
+    if(ec == websocket::error::closed) {
+        std::cout << "[presence] websocket closed session=" << static_cast<const void*>(this)
+                  << " remote=" << remote_endpoint_
+                  << " bound_user_id=" << authenticated_user_id_
+                  << std::endl;
         return;
+    }
 
     if(ec) {
         std::cerr << "read: " << ec.message() << std::endl;
+        std::cout << "[presence] websocket read error session=" << static_cast<const void*>(this)
+                  << " remote=" << remote_endpoint_
+                  << " bound_user_id=" << authenticated_user_id_
+                  << " error=" << ec.message() << std::endl;
         return;
     }
 
@@ -2113,6 +2405,8 @@ void websocket_session::on_read(
         response_code = protocol_code::OK;
         if (request.type == "AUTH" && request.action == "LOGIN") {
             ok = handle_login(request.data, response_data, message, response_code);
+        } else if (request.type == "AUTH" && request.action == "LOGOUT") {
+            ok = handle_logout(request.data, response_data, message, response_code);
         } else if (request.type == "AUTH" && request.action == "REGISTER") {
             ok = handle_register(request.data, response_data, message, response_code);
         } else if (request.type == "PROFILE" && request.action == "GET") {
@@ -2183,6 +2477,12 @@ void websocket_session::on_write(
 
 websocket_session::~websocket_session() noexcept
 {
+    std::cout << "[presence] session destroying session=" << static_cast<const void*>(this)
+              << " remote=" << remote_endpoint_
+              << " bound_user_id=" << authenticated_user_id_
+              << " bound_numeric_id=" << authenticated_numeric_id_
+              << std::endl;
+    unbind_authenticated_user(false, nullptr);
     if (!remote_endpoint_.empty()) {
         std::cout << "WebSocket session closed for " << remote_endpoint_ << std::endl;
     }

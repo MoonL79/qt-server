@@ -56,7 +56,7 @@ CREATE DATABASE IF NOT EXISTS app_db
   COLLATE utf8mb4_0900_ai_ci;
 
 CREATE USER IF NOT EXISTS 'app_user'@'%'
-IDENTIFIED WITH caching_sha2_password BY 'StrongPass_2026!';
+IDENTIFIED WITH caching_sha2_password BY '123456';
 
 GRANT ALL PRIVILEGES ON app_db.* TO 'app_user'@'%';
 FLUSH PRIVILEGES;

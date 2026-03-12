@@ -28,7 +28,7 @@ CREATE DATABASE IF NOT EXISTS app_db
 
 ```sql
 CREATE USER IF NOT EXISTS 'app_user'@'%'
-IDENTIFIED WITH caching_sha2_password BY 'StrongPass_2026!';
+IDENTIFIED WITH caching_sha2_password BY '123456';
 ```
 
 授予权限：
@@ -67,7 +67,7 @@ SELECT DATABASE(), CURRENT_USER(), NOW();
 
 ```sql
 CREATE USER 'app_user'@'192.168.14.50'
-IDENTIFIED WITH caching_sha2_password BY 'StrongPass_2026!';
+IDENTIFIED WITH caching_sha2_password BY '123456';
 GRANT ALL PRIVILEGES ON app_db.* TO 'app_user'@'192.168.14.50';
 FLUSH PRIVILEGES;
 ```
@@ -81,7 +81,7 @@ FLUSH PRIVILEGES;
 处理：
 
 ```sql
-ALTER USER 'app_user'@'%' IDENTIFIED WITH caching_sha2_password BY 'StrongPass_2026!';
+ALTER USER 'app_user'@'%' IDENTIFIED WITH caching_sha2_password BY '123456';
 FLUSH PRIVILEGES;
 ```
 
@@ -108,7 +108,7 @@ MYSQL_HOST=192.168.14.133
 MYSQL_PORT=3306
 MYSQL_DATABASE=app_db
 MYSQL_USER=app_user
-MYSQL_PASSWORD=StrongPass_2026!
+MYSQL_PASSWORD=123456
 ```
 
 ## 7. 快速检查清单

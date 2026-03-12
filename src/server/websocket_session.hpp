@@ -5,6 +5,7 @@
 #include <boost/beast/websocket.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/json.hpp>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <iostream>
@@ -60,6 +61,9 @@ class websocket_session : public std::enable_shared_from_this<websocket_session>
     beast::flat_buffer buffer_;
     std::string remote_endpoint_;
     std::string outbound_message_;
+    std::uint64_t authenticated_user_id_ = 0;
+    std::uint64_t authenticated_numeric_id_ = 0;
+    std::string authenticated_username_;
 
 public:
     // Take ownership of the socket
@@ -86,10 +90,14 @@ private:
                                 json::object& response_data,
                                 std::string& message,
                                 protocol_code& response_code);
-    static bool handle_login(const json::object& data,
-                             json::object& response_data,
-                             std::string& message,
-                             protocol_code& response_code);
+    bool handle_login(const json::object& data,
+                      json::object& response_data,
+                      std::string& message,
+                      protocol_code& response_code);
+    bool handle_logout(const json::object& data,
+                       json::object& response_data,
+                       std::string& message,
+                       protocol_code& response_code);
     static bool handle_profile_get(const json::object& data,
                                    json::object& response_data,
                                    std::string& message,
@@ -130,6 +138,12 @@ private:
                                               bool ok,
                                               const std::string& message,
                                               json::object data);
+    void bind_authenticated_user(std::uint64_t user_id,
+                                 std::uint64_t numeric_id,
+                                 const std::string& username,
+                                 json::object* response_data = nullptr);
+    void unbind_authenticated_user(bool explicit_logout,
+                                   json::object* response_data = nullptr);
 
     void on_accept(beast::error_code ec);
 

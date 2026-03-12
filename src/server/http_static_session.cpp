@@ -754,9 +754,14 @@ void http_static_session::handle_upload_avatar()
         return;
     }
     const unsigned long long user_id_num = std::strtoull(user_id.c_str(), nullptr, 10);
+    unsigned long long token_user_id = 0ULL;
     std::string token_error;
-    if (!validate_upload_token(bearer, user_id_num, token_error)) {
+    if (!validate_upload_token(bearer, token_user_id, token_error)) {
         send_json_response(http::status::unauthorized, false, token_error);
+        return;
+    }
+    if (token_user_id != user_id_num) {
+        send_json_response(http::status::unauthorized, false, "token does not match user_id");
         return;
     }
     if (file_part.data.size() > k_avatar_max_bytes) {
