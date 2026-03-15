@@ -42,6 +42,7 @@
 - `SEND`
 - `PULL`
 - `ACK`
+- `PRESENCE`（服务端主动推送）
 
 ## 3. 三类 data 格式
 
@@ -287,6 +288,23 @@
 }
 ```
 
+4. `action = PRESENCE`
+```json
+{
+  "user_id": "string",
+  "numeric_id": "string",
+  "is_online": true,
+  "last_seen_at": "UTC ISO8601",
+  "presence_event": "online | offline"
+}
+```
+
+说明：
+- 该动作由服务端主动推送。
+- 仅在用户在线状态发生边界变化时触发：首次上线、最后一个在线连接离线。
+- 广播范围为该用户所有当前在线好友的所有当前在线终端。
+- 该事件不做离线补发，也不持久化。
+
 ## 4. 响应格式
 
 服务端响应仍使用同一信封结构：
@@ -333,6 +351,7 @@
 - `AUTH/LOGIN` 成功后会将 `user_im_profile.is_online` 置为 `1`
 - `AUTH/LOGOUT` 成功后会将当前连接对应用户置为离线；若连接异常关闭，服务端也会兜底离线
 - `PROFILE/LIST_FRIENDS` 会按 `data.numeric_id` 返回该用户的好友列表 `data.friends`，其中 `status/user_status` 为账号状态，`is_online/last_seen_at` 为在线状态
+- 当用户首次上线或最后一个在线连接离线时，服务端会主动向其所有在线好友广播 `MESSAGE/PRESENCE`
 - 请求失败：`code != 0`，`data.ok = false`，`data.message` 给出原因，可能附带 `data.received_payload`
 
 说明：服务端将 `password` 转为 `password_hash` 后再入库，当前实现为 `PBKDF2-HMAC-SHA256`（随机盐 + 高迭代），满足生产可用的基础密码存储要求。
