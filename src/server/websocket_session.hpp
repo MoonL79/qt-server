@@ -6,9 +6,11 @@
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/json.hpp>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <string>
 #include <iostream>
+#include <vector>
 
 namespace qt_server {
 namespace server {
@@ -60,7 +62,8 @@ class websocket_session : public std::enable_shared_from_this<websocket_session>
     websocket::stream<tcp::socket> ws_;
     beast::flat_buffer buffer_;
     std::string remote_endpoint_;
-    std::string outbound_message_;
+    std::deque<std::string> pending_writes_;
+    bool write_in_progress_ = false;
     std::uint64_t authenticated_user_id_ = 0;
     std::uint64_t authenticated_numeric_id_ = 0;
     std::string authenticated_username_;
@@ -138,12 +141,20 @@ private:
                                               bool ok,
                                               const std::string& message,
                                               json::object data);
+    static std::vector<std::uint64_t> query_friend_user_ids(std::uint64_t user_id);
+    static void broadcast_presence_to_friends(std::uint64_t user_id,
+                                              std::uint64_t numeric_id,
+                                              bool is_online,
+                                              const std::string& last_seen_at,
+                                              const char* presence_event);
     void bind_authenticated_user(std::uint64_t user_id,
                                  std::uint64_t numeric_id,
                                  const std::string& username,
                                  json::object* response_data = nullptr);
     void unbind_authenticated_user(bool explicit_logout,
                                    json::object* response_data = nullptr);
+    void queue_outbound_message(std::string payload);
+    void start_next_write();
 
     void on_accept(beast::error_code ec);
 

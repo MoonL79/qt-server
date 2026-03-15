@@ -1,6 +1,7 @@
 #include "server/websocket_session.hpp"
 #include "server/upload_token_store.hpp"
 #include <boost/beast/core/buffers_to_string.hpp>
+#include <algorithm>
 #include <chrono>
 #include <cctype>
 #include <cstdint>
@@ -27,6 +28,8 @@ namespace {
 
 std::mutex g_presence_mutex;
 std::unordered_map<unsigned long long, std::size_t> g_online_session_counts;
+std::mutex g_authenticated_sessions_mutex;
+std::unordered_map<unsigned long long, std::vector<std::weak_ptr<websocket_session>>> g_authenticated_sessions;
 
 struct mysql_config
 {
@@ -38,6 +41,81 @@ struct mysql_config
 };
 
 json::object build_mysql_config_debug(const mysql_config& cfg);
+
+void prune_expired_session_refs(std::vector<std::weak_ptr<websocket_session>>& sessions)
+{
+    sessions.erase(std::remove_if(sessions.begin(),
+                                  sessions.end(),
+                                  [](const std::weak_ptr<websocket_session>& entry) {
+                                      return entry.expired();
+                                  }),
+                   sessions.end());
+}
+
+void register_authenticated_session(unsigned long long user_id,
+                                    const std::shared_ptr<websocket_session>& session)
+{
+    std::lock_guard<std::mutex> lock(g_authenticated_sessions_mutex);
+    std::vector<std::weak_ptr<websocket_session>>& sessions = g_authenticated_sessions[user_id];
+    prune_expired_session_refs(sessions);
+    for (const std::weak_ptr<websocket_session>& entry : sessions) {
+        const std::shared_ptr<websocket_session> existing = entry.lock();
+        if (existing && existing.get() == session.get()) {
+            return;
+        }
+    }
+    sessions.push_back(session);
+}
+
+void unregister_authenticated_session(unsigned long long user_id,
+                                      const websocket_session* session)
+{
+    if (user_id == 0ULL || session == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_authenticated_sessions_mutex);
+    const auto it = g_authenticated_sessions.find(user_id);
+    if (it == g_authenticated_sessions.end()) {
+        return;
+    }
+    std::vector<std::weak_ptr<websocket_session>>& sessions = it->second;
+    sessions.erase(std::remove_if(sessions.begin(),
+                                  sessions.end(),
+                                  [session](const std::weak_ptr<websocket_session>& entry) {
+                                      const std::shared_ptr<websocket_session> existing = entry.lock();
+                                      return !existing || existing.get() == session;
+                                  }),
+                   sessions.end());
+    if (sessions.empty()) {
+        g_authenticated_sessions.erase(it);
+    }
+}
+
+std::vector<std::shared_ptr<websocket_session>> snapshot_authenticated_sessions(unsigned long long user_id)
+{
+    std::vector<std::shared_ptr<websocket_session>> sessions;
+    if (user_id == 0ULL) {
+        return sessions;
+    }
+    std::lock_guard<std::mutex> lock(g_authenticated_sessions_mutex);
+    const auto it = g_authenticated_sessions.find(user_id);
+    if (it == g_authenticated_sessions.end()) {
+        return sessions;
+    }
+    std::vector<std::weak_ptr<websocket_session>>& refs = it->second;
+    prune_expired_session_refs(refs);
+    sessions.reserve(refs.size());
+    for (const std::weak_ptr<websocket_session>& entry : refs) {
+        const std::shared_ptr<websocket_session> session = entry.lock();
+        if (session) {
+            sessions.push_back(session);
+        }
+    }
+    if (refs.empty()) {
+        g_authenticated_sessions.erase(it);
+    }
+    return sessions;
+}
 
 std::string mask_secret(const std::string& value)
 {
@@ -2177,6 +2255,99 @@ std::string websocket_session::build_response_payload(const std::string& type,
     return json::serialize(response);
 }
 
+std::vector<std::uint64_t> websocket_session::query_friend_user_ids(std::uint64_t user_id)
+{
+    std::vector<std::uint64_t> friend_user_ids;
+    if (user_id == 0ULL) {
+        return friend_user_ids;
+    }
+
+    const mysql_config cfg = load_mysql_config();
+    std::string config_error;
+    if (!is_mysql_config_valid(cfg, config_error)) {
+        std::cerr << "[presence] skip friend query for user_id=" << user_id
+                  << ": mysql config invalid: " << config_error << std::endl;
+        return friend_user_ids;
+    }
+
+    std::ostringstream sql;
+    sql << "SELECT DISTINCT friend_user_id "
+        << "FROM friendships "
+        << "WHERE user_id=" << user_id << " AND status=1 "
+        << "ORDER BY friend_user_id ASC;";
+
+    std::string command_output;
+    int exit_code = 0;
+    if (!run_mysql_sql(cfg, sql.str(), command_output, exit_code)) {
+        std::cerr << "[presence] skip friend query for user_id=" << user_id
+                  << ": mysql exit=" << exit_code
+                  << " output=" << trim_copy(command_output) << std::endl;
+        return friend_user_ids;
+    }
+
+    const std::vector<std::string> lines = collect_non_empty_lines(command_output);
+    friend_user_ids.reserve(lines.size());
+    for (const std::string& line : lines) {
+        unsigned long long friend_user_id = 0ULL;
+        if (!parse_unsigned_long_long(trim_copy(line), friend_user_id) || friend_user_id == 0ULL) {
+            std::cerr << "[presence] skip malformed friend id row for user_id=" << user_id
+                      << ": " << line << std::endl;
+            continue;
+        }
+        friend_user_ids.push_back(friend_user_id);
+    }
+    return friend_user_ids;
+}
+
+void websocket_session::broadcast_presence_to_friends(std::uint64_t user_id,
+                                                      std::uint64_t numeric_id,
+                                                      bool is_online,
+                                                      const std::string& last_seen_at,
+                                                      const char* presence_event)
+{
+    if (user_id == 0ULL || numeric_id == 0ULL || presence_event == nullptr || *presence_event == '\0') {
+        return;
+    }
+
+    const std::vector<std::uint64_t> friend_user_ids = query_friend_user_ids(user_id);
+    if (friend_user_ids.empty()) {
+        return;
+    }
+
+    json::object data;
+    data["user_id"] = std::to_string(user_id);
+    data["numeric_id"] = std::to_string(numeric_id);
+    data["is_online"] = is_online;
+    data["last_seen_at"] = last_seen_at;
+    data["presence_event"] = presence_event;
+
+    const std::string payload = build_response_payload("MESSAGE",
+                                                       "PRESENCE",
+                                                       "",
+                                                       protocol_code::OK,
+                                                       true,
+                                                       "friend presence changed",
+                                                       std::move(data));
+
+    std::size_t delivered_sessions = 0U;
+    for (std::uint64_t friend_user_id : friend_user_ids) {
+        const std::vector<std::shared_ptr<websocket_session>> sessions =
+            snapshot_authenticated_sessions(friend_user_id);
+        for (const std::shared_ptr<websocket_session>& session : sessions) {
+            session->queue_outbound_message(payload);
+            ++delivered_sessions;
+        }
+    }
+
+    std::cout << "[presence] broadcast event=" << presence_event
+              << " user_id=" << user_id
+              << " numeric_id=" << numeric_id
+              << " is_online=" << (is_online ? "true" : "false")
+              << " friends=" << friend_user_ids.size()
+              << " delivered_sessions=" << delivered_sessions
+              << std::endl;
+}
+
 void websocket_session::bind_authenticated_user(std::uint64_t user_id,
                                                 std::uint64_t numeric_id,
                                                 const std::string& username,
@@ -2211,6 +2382,7 @@ void websocket_session::bind_authenticated_user(std::uint64_t user_id,
     authenticated_user_id_ = user_id;
     authenticated_numeric_id_ = numeric_id;
     authenticated_username_ = username;
+    register_authenticated_session(user_id, shared_from_this());
 
     std::cout << "[presence] bind session=" << static_cast<const void*>(this)
               << " remote=" << remote_endpoint_
@@ -2227,6 +2399,9 @@ void websocket_session::bind_authenticated_user(std::uint64_t user_id,
                   << " remote=" << remote_endpoint_
                   << " user_id=" << user_id << std::endl;
     }
+    if (should_mark_online) {
+        broadcast_presence_to_friends(user_id, numeric_id, true, now_utc_iso8601(), "online");
+    }
 }
 
 void websocket_session::unbind_authenticated_user(bool explicit_logout,
@@ -2241,9 +2416,11 @@ void websocket_session::unbind_authenticated_user(bool explicit_logout,
     }
 
     const std::uint64_t user_id = authenticated_user_id_;
+    const std::uint64_t numeric_id = authenticated_numeric_id_;
     bool should_mark_offline = false;
     std::size_t old_count = 0U;
     std::size_t new_count = 0U;
+    unregister_authenticated_session(user_id, this);
     {
         std::lock_guard<std::mutex> lock(g_presence_mutex);
         const auto it = g_online_session_counts.find(user_id);
@@ -2283,6 +2460,9 @@ void websocket_session::unbind_authenticated_user(bool explicit_logout,
         std::cout << "[presence] unbind mark offline failed session=" << static_cast<const void*>(this)
                   << " remote=" << remote_endpoint_
                   << " user_id=" << user_id << std::endl;
+    }
+    if (should_mark_offline) {
+        broadcast_presence_to_friends(user_id, numeric_id, false, now_utc_iso8601(), "offline");
     }
 
     if (explicit_logout && response_data != nullptr) {
@@ -2341,6 +2521,31 @@ void websocket_session::on_accept(beast::error_code ec)
     do_read();
 }
 
+void websocket_session::queue_outbound_message(std::string payload)
+{
+    auto self = shared_from_this();
+    net::post(ws_.get_executor(),
+              [self, payload = std::move(payload)]() mutable {
+                  self->pending_writes_.push_back(std::move(payload));
+                  self->start_next_write();
+              });
+}
+
+void websocket_session::start_next_write()
+{
+    if (write_in_progress_ || pending_writes_.empty()) {
+        return;
+    }
+
+    write_in_progress_ = true;
+    ws_.text(true);
+    ws_.async_write(
+        net::buffer(pending_writes_.front()),
+        beast::bind_front_handler(
+            &websocket_session::on_write,
+            shared_from_this()));
+}
+
 void websocket_session::do_read()
 {
     // Read a message into our buffer
@@ -2381,6 +2586,7 @@ void websocket_session::on_read(
     }
 
     const std::string payload = beast::buffers_to_string(buffer_.data());
+    buffer_.consume(buffer_.size());
     envelope request;
     std::string error_message;
     json::object response_data;
@@ -2434,7 +2640,7 @@ void websocket_session::on_read(
         response_data["echo"] = std::move(safe_echo);
     }
 
-    outbound_message_ = build_response_payload(
+    const std::string outbound_message = build_response_payload(
         response_type,
         response_action,
         response_request_id,
@@ -2445,15 +2651,11 @@ void websocket_session::on_read(
 
     if (!remote_endpoint_.empty()) {
         std::cout << "Sending JSON response to " << remote_endpoint_
-                  << ": " << outbound_message_ << std::endl;
+                  << ": " << outbound_message << std::endl;
     }
 
-    ws_.text(true);
-    ws_.async_write(
-        net::buffer(outbound_message_),
-        beast::bind_front_handler(
-            &websocket_session::on_write,
-            shared_from_this()));
+    queue_outbound_message(outbound_message);
+    do_read();
 }
 
 void websocket_session::on_write(
@@ -2464,15 +2666,16 @@ void websocket_session::on_write(
 
     if(ec) {
         std::cerr << "write: " << ec.message() << std::endl;
+        write_in_progress_ = false;
+        pending_writes_.clear();
         return;
     }
 
-    // Clear the buffer
-    buffer_.consume(buffer_.size());
-    outbound_message_.clear();
-
-    // Do another read
-    do_read();
+    write_in_progress_ = false;
+    if (!pending_writes_.empty()) {
+        pending_writes_.pop_front();
+    }
+    start_next_write();
 }
 
 websocket_session::~websocket_session() noexcept
