@@ -50,9 +50,9 @@
 
 ### 3.3 MESSAGE
 
-- `SEND`：`{ "conversation_id": "string", "content": "string" }`
-- `PULL`：`{ "conversation_id": "string" }`
-- `ACK`：`{ "conversation_id": "string", "message_id": "string", "read": true }`
+- `SEND`：`{ "conversation_id": "string，对应 conversations.conversation_uuid", "content": "string" }`
+- `PULL`：`{ "conversation_id": "string，对应 conversations.conversation_uuid" }`
+- `ACK`：`{ "conversation_id": "string，对应 conversations.conversation_uuid", "message_id": "string", "read": true }`
 
 ## 4. 服务端实现行为
 

@@ -876,6 +876,86 @@ bool is_mysql_config_valid(const mysql_config& cfg, std::string& reason)
     return true;
 }
 
+bool ensure_private_conversation_uuid(const mysql_config& cfg,
+                                      unsigned long long user_id,
+                                      unsigned long long friend_user_id,
+                                      std::string& conversation_uuid,
+                                      std::string& command_output,
+                                      int& exit_code)
+{
+    conversation_uuid.clear();
+    command_output.clear();
+    exit_code = 0;
+    if (user_id == 0ULL || friend_user_id == 0ULL || user_id == friend_user_id) {
+        command_output = "invalid private conversation participants";
+        exit_code = -1;
+        return false;
+    }
+
+    std::ostringstream select_sql;
+    select_sql << "SELECT c.conversation_uuid "
+               << "FROM conversations c "
+               << "JOIN conversation_members cm1 ON cm1.conversation_id=c.id AND cm1.user_id=" << user_id << " "
+               << "JOIN conversation_members cm2 ON cm2.conversation_id=c.id AND cm2.user_id=" << friend_user_id << " "
+               << "WHERE c.type=1 "
+               << "AND (SELECT COUNT(*) FROM conversation_members x WHERE x.conversation_id=c.id)=2 "
+               << "ORDER BY c.id ASC "
+               << "LIMIT 1;";
+    if (!run_mysql_sql(cfg, select_sql.str(), command_output, exit_code)) {
+        return false;
+    }
+
+    std::vector<std::string> lines = collect_non_empty_lines(command_output);
+    if (!lines.empty()) {
+        conversation_uuid = trim_copy(lines.back());
+        if (!conversation_uuid.empty()) {
+            return true;
+        }
+    }
+
+    const std::string new_conversation_uuid = generate_uuid_v4_like();
+    std::ostringstream create_sql;
+    create_sql << "START TRANSACTION; "
+               << "SET @existing_conversation_id := ("
+               << "SELECT c.id "
+               << "FROM conversations c "
+               << "JOIN conversation_members cm1 ON cm1.conversation_id=c.id AND cm1.user_id=" << user_id << " "
+               << "JOIN conversation_members cm2 ON cm2.conversation_id=c.id AND cm2.user_id=" << friend_user_id << " "
+               << "WHERE c.type=1 "
+               << "AND (SELECT COUNT(*) FROM conversation_members x WHERE x.conversation_id=c.id)=2 "
+               << "ORDER BY c.id ASC "
+               << "LIMIT 1"
+               << "); "
+               << "INSERT INTO conversations (conversation_uuid, type, owner_user_id, name, avatar_url, notice, last_message_id) "
+               << "SELECT '" << sql_escape(new_conversation_uuid) << "', 1, NULL, NULL, NULL, NULL, NULL "
+               << "FROM DUAL WHERE @existing_conversation_id IS NULL; "
+               << "SET @conversation_id := IFNULL(@existing_conversation_id, LAST_INSERT_ID()); "
+               << "INSERT INTO conversation_members (conversation_id, user_id, role) "
+               << "SELECT @conversation_id, members.user_id, 0 "
+               << "FROM (SELECT " << user_id << " AS user_id UNION ALL SELECT " << friend_user_id << ") members "
+               << "WHERE @existing_conversation_id IS NULL "
+               << "ON DUPLICATE KEY UPDATE role=VALUES(role); "
+               << "SELECT conversation_uuid FROM conversations WHERE id=@conversation_id LIMIT 1; "
+               << "COMMIT;";
+    if (!run_mysql_sql(cfg, create_sql.str(), command_output, exit_code)) {
+        return false;
+    }
+
+    lines = collect_non_empty_lines(command_output);
+    if (lines.empty()) {
+        command_output = "missing conversation uuid after create";
+        exit_code = -1;
+        return false;
+    }
+    conversation_uuid = trim_copy(lines.back());
+    if (conversation_uuid.empty()) {
+        command_output = "empty conversation uuid after create";
+        exit_code = -1;
+        return false;
+    }
+    return true;
+}
+
 bool update_user_presence_in_db(const mysql_config& cfg,
                                 unsigned long long user_id,
                                 bool is_online,
@@ -2049,6 +2129,24 @@ bool websocket_session::handle_profile_list_friends(const json::object& data,
         item["nickname"] = (cols[6] == "\\N") ? "" : cols[6];
         item["avatar_url"] = (cols[7] == "\\N") ? "" : cols[7];
         item["bio"] = (cols[8] == "\\N") ? "" : cols[8];
+        std::string conversation_uuid;
+        std::string conversation_output;
+        int conversation_exit_code = 0;
+        if (!ensure_private_conversation_uuid(cfg,
+                                              requester_user_id,
+                                              friend_user_id,
+                                              conversation_uuid,
+                                              conversation_output,
+                                              conversation_exit_code)) {
+            response_code = protocol_code::INTERNAL_ERROR;
+            message = "list friends failed: unable to ensure private conversation";
+            response_data["debug"].as_object()["conversation_user_id"] = std::to_string(friend_user_id);
+            response_data["debug"].as_object()["conversation_mysql_exit_code"] = conversation_exit_code;
+            response_data["debug"].as_object()["conversation_mysql_output"] = conversation_output;
+            return false;
+        }
+        item["conversation_uuid"] = conversation_uuid;
+        item["conversation_id"] = conversation_uuid;
         friends.push_back(std::move(item));
     }
 
@@ -2148,6 +2246,268 @@ bool websocket_session::handle_profile_delete_friend(const json::object& data,
     response_data["removed"] = (deleted_rows > 0ULL);
     response_code = protocol_code::OK;
     message = "friend deleted";
+    return true;
+}
+
+bool websocket_session::handle_message_send(const json::object& data,
+                                            json::object& response_data,
+                                            std::string& message,
+                                            protocol_code& response_code)
+{
+    if (authenticated_user_id_ == 0ULL || authenticated_numeric_id_ == 0ULL) {
+        response_code = protocol_code::AUTH_REQUIRED;
+        message = "message send requires authenticated session";
+        return false;
+    }
+
+    const std::string conversation_id = trim_copy(read_string_or_empty(data, "conversation_id"));
+    const std::string content = trim_copy(read_string_or_empty(data, "content"));
+    const std::string sent_at = now_utc_iso8601();
+    if (conversation_id.empty() || content.empty()) {
+        response_code = protocol_code::MESSAGE_INVALID;
+        message = "field 'data.conversation_id' and 'data.content' are required";
+        return false;
+    }
+    if (content.size() > 4096U) {
+        response_code = protocol_code::MESSAGE_TOO_LARGE;
+        message = "field 'data.content' exceeds 4096 characters";
+        return false;
+    }
+
+    const mysql_config cfg = load_mysql_config();
+    response_data["debug"] = build_mysql_config_debug(cfg);
+    std::string config_error;
+    if (!is_mysql_config_valid(cfg, config_error)) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "message send failed: database config missing";
+        response_data["debug"].as_object()["config_error"] = config_error;
+        return false;
+    }
+
+    std::ostringstream conversation_sql;
+    conversation_sql << "SELECT id, type "
+                     << "FROM conversations "
+                     << "WHERE conversation_uuid='" << sql_escape(conversation_id) << "' "
+                     << "LIMIT 1;";
+
+    std::string command_output;
+    int exit_code = 0;
+    if (!run_mysql_sql(cfg, conversation_sql.str(), command_output, exit_code)) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "message send failed in database";
+        response_data["debug"].as_object()["mysql_exit_code"] = exit_code;
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    const std::vector<std::string> conversation_lines = collect_non_empty_lines(command_output);
+    if (conversation_lines.empty()) {
+        response_code = protocol_code::MESSAGE_NOT_FOUND;
+        message = "conversation not found";
+        response_data["conversation_id"] = conversation_id;
+        return false;
+    }
+
+    const std::vector<std::string> conversation_cols = split_by_tab(trim_copy(conversation_lines.front()));
+    unsigned long long internal_conversation_id = 0ULL;
+    unsigned long long conversation_type = 0ULL;
+    if (conversation_cols.size() < 2U
+        || !parse_unsigned_long_long(conversation_cols[0], internal_conversation_id)
+        || !parse_unsigned_long_long(conversation_cols[1], conversation_type)
+        || internal_conversation_id == 0ULL) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "message send failed: unexpected conversation output";
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    std::ostringstream membership_sql;
+    membership_sql << "SELECT role, "
+                   << "CASE WHEN mute_until IS NOT NULL AND mute_until > UTC_TIMESTAMP() THEN 1 ELSE 0 END "
+                   << "FROM conversation_members "
+                   << "WHERE conversation_id=" << internal_conversation_id
+                   << " AND user_id=" << authenticated_user_id_
+                   << " LIMIT 1;";
+
+    command_output.clear();
+    exit_code = 0;
+    if (!run_mysql_sql(cfg, membership_sql.str(), command_output, exit_code)) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "message send failed in database";
+        response_data["debug"].as_object()["mysql_exit_code"] = exit_code;
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    const std::vector<std::string> membership_lines = collect_non_empty_lines(command_output);
+    if (membership_lines.empty()) {
+        response_code = protocol_code::PERMISSION_DENIED;
+        message = "sender is not a conversation member";
+        response_data["conversation_id"] = conversation_id;
+        return false;
+    }
+
+    const std::vector<std::string> membership_cols = split_by_tab(trim_copy(membership_lines.front()));
+    unsigned long long ignored_sender_role = 0ULL;
+    unsigned long long sender_muted = 0ULL;
+    if (membership_cols.size() < 2U
+        || !parse_unsigned_long_long(membership_cols[0], ignored_sender_role)
+        || !parse_unsigned_long_long(membership_cols[1], sender_muted)) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "message send failed: unexpected member output";
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+    if (sender_muted != 0ULL) {
+        response_code = protocol_code::PERMISSION_DENIED;
+        message = "sender is muted in conversation";
+        response_data["conversation_id"] = conversation_id;
+        return false;
+    }
+
+    std::ostringstream recipients_sql;
+    recipients_sql << "SELECT user_id "
+                   << "FROM conversation_members "
+                   << "WHERE conversation_id=" << internal_conversation_id
+                   << " AND user_id<>" << authenticated_user_id_
+                   << " ORDER BY user_id ASC;";
+
+    command_output.clear();
+    exit_code = 0;
+    if (!run_mysql_sql(cfg, recipients_sql.str(), command_output, exit_code)) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "message send failed in database";
+        response_data["debug"].as_object()["mysql_exit_code"] = exit_code;
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    const std::vector<std::string> recipient_lines = collect_non_empty_lines(command_output);
+    std::vector<unsigned long long> recipient_user_ids;
+    recipient_user_ids.reserve(recipient_lines.size());
+    for (const std::string& line : recipient_lines) {
+        unsigned long long recipient_user_id = 0ULL;
+        if (!parse_unsigned_long_long(trim_copy(line), recipient_user_id) || recipient_user_id == 0ULL) {
+            response_code = protocol_code::INTERNAL_ERROR;
+            message = "message send failed: unexpected recipient output";
+            response_data["debug"].as_object()["mysql_output"] = command_output;
+            return false;
+        }
+        recipient_user_ids.push_back(recipient_user_id);
+    }
+
+    const std::string message_id = generate_uuid_v4_like();
+    std::ostringstream receipt_values;
+    std::size_t online_recipients = 0U;
+    std::size_t delivered_sessions = 0U;
+    std::vector<std::shared_ptr<websocket_session>> recipient_sessions;
+    for (std::size_t i = 0; i < recipient_user_ids.size(); ++i) {
+        const unsigned long long recipient_user_id = recipient_user_ids[i];
+        const std::vector<std::shared_ptr<websocket_session>> sessions =
+            snapshot_authenticated_sessions(recipient_user_id);
+        const bool delivered = !sessions.empty();
+        if (i != 0U) {
+            receipt_values << ", ";
+        }
+        receipt_values << "(@message_id, " << recipient_user_id << ", ";
+        if (delivered) {
+            receipt_values << "NOW()";
+            ++online_recipients;
+            delivered_sessions += sessions.size();
+            recipient_sessions.insert(recipient_sessions.end(), sessions.begin(), sessions.end());
+        } else {
+            receipt_values << "NULL";
+        }
+        receipt_values << ")";
+    }
+
+    std::ostringstream send_sql;
+    send_sql << "START TRANSACTION; "
+             << "SELECT @next_seq := COALESCE(MAX(seq), 0) + 1 "
+             << "FROM messages WHERE conversation_id=" << internal_conversation_id << " FOR UPDATE; "
+             << "INSERT INTO messages (message_uuid, conversation_id, sender_user_id, seq, message_type, content, client_msg_id) VALUES ("
+             << "'" << sql_escape(message_id) << "', "
+             << internal_conversation_id << ", "
+             << authenticated_user_id_ << ", "
+             << "@next_seq, "
+             << "1, "
+             << "JSON_OBJECT('text', '" << sql_escape(content) << "'), "
+             << "NULL); "
+             << "SET @message_id := LAST_INSERT_ID(); "
+             << "UPDATE conversations SET last_message_id=@message_id, updated_at=NOW() WHERE id=" << internal_conversation_id << "; ";
+    if (!recipient_user_ids.empty()) {
+        send_sql << "INSERT INTO message_receipts (message_id, user_id, delivered_at) VALUES "
+                 << receipt_values.str() << "; ";
+    }
+    send_sql << "SELECT @message_id, @next_seq; "
+             << "COMMIT;";
+
+    command_output.clear();
+    exit_code = 0;
+    if (!run_mysql_sql(cfg, send_sql.str(), command_output, exit_code)) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "message send failed in database";
+        response_data["debug"].as_object()["mysql_exit_code"] = exit_code;
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    const std::vector<std::string> send_lines = collect_non_empty_lines(command_output);
+    if (send_lines.empty()) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "message send failed: missing insert result";
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    const std::vector<std::string> send_cols = split_by_tab(trim_copy(send_lines.back()));
+    unsigned long long internal_message_id = 0ULL;
+    unsigned long long message_seq = 0ULL;
+    if (send_cols.size() < 2U
+        || !parse_unsigned_long_long(send_cols[0], internal_message_id)
+        || !parse_unsigned_long_long(send_cols[1], message_seq)
+        || internal_message_id == 0ULL
+        || message_seq == 0ULL) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "message send failed: unexpected insert output";
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    json::object event_data;
+    event_data["conversation_id"] = conversation_id;
+    event_data["message_id"] = message_id;
+    event_data["conversation_type"] = conversation_type;
+    event_data["seq"] = message_seq;
+    event_data["content"] = content;
+    event_data["sent_at"] = sent_at;
+    event_data["from_user_id"] = std::to_string(authenticated_user_id_);
+    event_data["from_numeric_id"] = std::to_string(authenticated_numeric_id_);
+    event_data["from_username"] = authenticated_username_;
+
+    const std::string payload = build_response_payload("MESSAGE",
+                                                       "SEND",
+                                                       "",
+                                                       protocol_code::OK,
+                                                       true,
+                                                       "incoming message",
+                                                       event_data);
+
+    for (const std::shared_ptr<websocket_session>& session : recipient_sessions) {
+        session->queue_outbound_message(payload);
+    }
+
+    response_data["conversation_id"] = conversation_id;
+    response_data["conversation_type"] = conversation_type;
+    response_data["message_id"] = message_id;
+    response_data["seq"] = message_seq;
+    response_data["content"] = content;
+    response_data["sent_at"] = sent_at;
+    response_data["recipient_count"] = static_cast<std::uint64_t>(recipient_user_ids.size());
+    response_data["online_recipient_count"] = static_cast<std::uint64_t>(online_recipients);
+    response_data["delivered_sessions"] = static_cast<std::uint64_t>(delivered_sessions);
+    response_code = protocol_code::OK;
+    message = "message sent";
     return true;
 }
 
@@ -2627,6 +2987,8 @@ void websocket_session::on_read(
             ok = handle_profile_list_friends(request.data, response_data, message, response_code);
         } else if (request.type == "PROFILE" && request.action == "DELETE_FRIEND") {
             ok = handle_profile_delete_friend(request.data, response_data, message, response_code);
+        } else if (request.type == "MESSAGE" && request.action == "SEND") {
+            ok = handle_message_send(request.data, response_data, message, response_code);
         } else {
             ok = true;
             message = "request accepted";
