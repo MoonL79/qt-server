@@ -125,6 +125,10 @@ private:
                                              json::object& response_data,
                                              std::string& message,
                                              protocol_code& response_code);
+    bool handle_message_send(const json::object& data,
+                             json::object& response_data,
+                             std::string& message,
+                             protocol_code& response_code);
     static bool validate_data_schema(const std::string& type,
                                      const std::string& action,
                                      const json::object& data,
