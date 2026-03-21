@@ -1040,7 +1040,8 @@ bool websocket_session::is_supported_action(const std::string& type, const std::
     }
     if (type == "PROFILE") {
         return action == "GET" || action == "GET_INFO" || action == "SET_INFO" || action == "UPDATE"
-            || action == "ADD_FRIEND" || action == "DELETE_FRIEND" || action == "LIST_FRIENDS";
+            || action == "ADD_FRIEND" || action == "DELETE_FRIEND" || action == "LIST_FRIENDS"
+            || action == "LIST_CONVERSATIONS";
     }
     if (type == "MESSAGE") {
         return action == "SEND" || action == "PULL" || action == "ACK";
@@ -1274,6 +1275,18 @@ bool websocket_session::validate_data_schema(const std::string& type,
             return true;
         }
         if (action == "LIST_FRIENDS") {
+            if (!require_string_field(data, "numeric_id", error_message)) {
+                error_code = protocol_code::PROFILE_VALIDATION_FAILED;
+                return false;
+            }
+            unsigned long long numeric_id = 0;
+            if (!parse_numeric_id_from_data(data, numeric_id, error_message)) {
+                error_code = protocol_code::PROFILE_VALIDATION_FAILED;
+                return false;
+            }
+            return true;
+        }
+        if (action == "LIST_CONVERSATIONS") {
             if (!require_string_field(data, "numeric_id", error_message)) {
                 error_code = protocol_code::PROFILE_VALIDATION_FAILED;
                 return false;
@@ -2158,6 +2171,160 @@ bool websocket_session::handle_profile_list_friends(const json::object& data,
     return true;
 }
 
+bool websocket_session::handle_profile_list_conversations(const json::object& data,
+                                                          json::object& response_data,
+                                                          std::string& message,
+                                                          protocol_code& response_code)
+{
+    unsigned long long requester_numeric_id = 0;
+    std::string parse_error;
+    if (!parse_numeric_id_from_data(data, requester_numeric_id, parse_error)) {
+        response_code = protocol_code::PROFILE_VALIDATION_FAILED;
+        message = parse_error;
+        return false;
+    }
+
+    const mysql_config cfg = load_mysql_config();
+    response_data["debug"] = build_mysql_config_debug(cfg);
+    std::string config_error;
+    if (!is_mysql_config_valid(cfg, config_error)) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "list conversations failed: database config missing";
+        response_data["debug"].as_object()["config_error"] = config_error;
+        return false;
+    }
+
+    std::ostringstream sql;
+    sql << "SET @user_id = (SELECT id FROM user_data WHERE numeric_id=" << requester_numeric_id << " LIMIT 1); "
+        << "SELECT IFNULL(@user_id, 0); "
+        << "SELECT "
+        << "u.id, "
+        << "COALESCE(u.numeric_id, 0), "
+        << "u.username, "
+        << "u.status, "
+        << "COALESCE(p.is_online, 0), "
+        << "COALESCE(DATE_FORMAT(p.last_seen_at, '%Y-%m-%dT%H:%i:%sZ'), ''), "
+        << "COALESCE(p.nickname, ''), "
+        << "COALESCE(p.avatar_url, ''), "
+        << "COALESCE(p.bio, '') "
+        << "FROM friendships f "
+        << "JOIN user_data u ON u.id=f.friend_user_id "
+        << "LEFT JOIN user_im_profile p ON p.user_id=u.id AND p.deleted_at IS NULL "
+        << "WHERE f.user_id=@user_id AND f.status=1 "
+        << "ORDER BY u.id ASC;";
+
+    std::string command_output;
+    int exit_code = 0;
+    if (!run_mysql_sql(cfg, sql.str(), command_output, exit_code)) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "list conversations failed in database";
+        response_data["debug"].as_object()["mysql_exit_code"] = exit_code;
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    const std::vector<std::string> lines = collect_non_empty_lines(command_output);
+    if (lines.empty()) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "list conversations failed: unexpected database output";
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    unsigned long long requester_user_id = 0;
+    if (!parse_unsigned_long_long(trim_copy(lines[0]), requester_user_id)) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "list conversations failed: unexpected database output";
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+    if (requester_user_id == 0ULL) {
+        response_code = protocol_code::PROFILE_NOT_FOUND;
+        message = "user not found";
+        return false;
+    }
+
+    json::array conversations;
+    for (std::size_t i = 1; i < lines.size(); ++i) {
+        const std::vector<std::string> cols = split_by_tab(lines[i]);
+        if (cols.size() < 9U) {
+            response_code = protocol_code::INTERNAL_ERROR;
+            message = "list conversations failed: unexpected database output";
+            response_data["debug"].as_object()["mysql_output"] = command_output;
+            return false;
+        }
+        unsigned long long peer_user_id = 0;
+        unsigned long long peer_numeric_id = 0;
+        unsigned long long user_status = 0;
+        unsigned long long is_online = 0;
+        if (!parse_unsigned_long_long(cols[0], peer_user_id)
+            || !parse_unsigned_long_long(cols[1], peer_numeric_id)
+            || !parse_unsigned_long_long(cols[3], user_status)
+            || !parse_unsigned_long_long(cols[4], is_online)) {
+            response_code = protocol_code::INTERNAL_ERROR;
+            message = "list conversations failed: unexpected database output";
+            response_data["debug"].as_object()["mysql_output"] = command_output;
+            return false;
+        }
+        unsigned int expected_numeric_id = 0U;
+        if (!build_numeric_user_id(peer_user_id, expected_numeric_id)
+            || peer_numeric_id != static_cast<unsigned long long>(expected_numeric_id)) {
+            response_code = protocol_code::INTERNAL_ERROR;
+            message = "list conversations failed: inconsistent user identity in database";
+            response_data["debug"].as_object()["mysql_output"] = command_output;
+            return false;
+        }
+
+        const std::string peer_username = (cols[2] == "\\N") ? "" : cols[2];
+        const std::string peer_last_seen_at = (cols[5] == "\\N") ? "" : cols[5];
+        const std::string peer_nickname = (cols[6] == "\\N") ? "" : cols[6];
+        const std::string peer_avatar_url = (cols[7] == "\\N") ? "" : cols[7];
+        const std::string peer_bio = (cols[8] == "\\N") ? "" : cols[8];
+        const std::string conversation_name = !peer_nickname.empty() ? peer_nickname : peer_username;
+
+        std::string conversation_uuid;
+        std::string conversation_output;
+        int conversation_exit_code = 0;
+        if (!ensure_private_conversation_uuid(cfg,
+                                              requester_user_id,
+                                              peer_user_id,
+                                              conversation_uuid,
+                                              conversation_output,
+                                              conversation_exit_code)) {
+            response_code = protocol_code::INTERNAL_ERROR;
+            message = "list conversations failed: unable to ensure private conversation";
+            response_data["debug"].as_object()["conversation_user_id"] = std::to_string(peer_user_id);
+            response_data["debug"].as_object()["conversation_mysql_exit_code"] = conversation_exit_code;
+            response_data["debug"].as_object()["conversation_mysql_output"] = conversation_output;
+            return false;
+        }
+
+        json::object item;
+        item["conversation_id"] = conversation_uuid;
+        item["conversation_uuid"] = conversation_uuid;
+        item["conversation_type"] = 1;
+        item["name"] = conversation_name;
+        item["avatar_url"] = peer_avatar_url;
+        item["peer_user_id"] = std::to_string(peer_user_id);
+        item["peer_numeric_id"] = std::to_string(peer_numeric_id);
+        item["peer_username"] = peer_username;
+        item["peer_nickname"] = peer_nickname;
+        item["peer_avatar_url"] = peer_avatar_url;
+        item["peer_bio"] = peer_bio;
+        item["peer_status"] = static_cast<int>(user_status);
+        item["peer_is_online"] = (is_online != 0ULL);
+        item["peer_last_seen_at"] = peer_last_seen_at;
+        conversations.push_back(std::move(item));
+    }
+
+    response_data["numeric_id"] = std::to_string(requester_numeric_id);
+    response_data["user_id"] = std::to_string(requester_user_id);
+    response_data["conversations"] = std::move(conversations);
+    response_code = protocol_code::OK;
+    message = "conversation list request accepted";
+    return true;
+}
+
 bool websocket_session::handle_profile_delete_friend(const json::object& data,
                                                      json::object& response_data,
                                                      std::string& message,
@@ -2985,6 +3152,8 @@ void websocket_session::on_read(
             ok = handle_profile_add_friend(request.data, response_data, message, response_code);
         } else if (request.type == "PROFILE" && request.action == "LIST_FRIENDS") {
             ok = handle_profile_list_friends(request.data, response_data, message, response_code);
+        } else if (request.type == "PROFILE" && request.action == "LIST_CONVERSATIONS") {
+            ok = handle_profile_list_conversations(request.data, response_data, message, response_code);
         } else if (request.type == "PROFILE" && request.action == "DELETE_FRIEND") {
             ok = handle_profile_delete_friend(request.data, response_data, message, response_code);
         } else if (request.type == "MESSAGE" && request.action == "SEND") {
