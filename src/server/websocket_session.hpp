@@ -121,6 +121,14 @@ private:
                                      json::object& response_data,
                                      std::string& message,
                                      protocol_code& response_code);
+    bool handle_profile_join_group(const json::object& data,
+                                   json::object& response_data,
+                                   std::string& message,
+                                   protocol_code& response_code);
+    bool handle_profile_list_groups(const json::object& data,
+                                    json::object& response_data,
+                                    std::string& message,
+                                    protocol_code& response_code);
     static bool handle_profile_list_friends(const json::object& data,
                                             json::object& response_data,
                                             std::string& message,
