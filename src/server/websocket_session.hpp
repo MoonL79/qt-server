@@ -117,6 +117,10 @@ private:
                                           json::object& response_data,
                                           std::string& message,
                                           protocol_code& response_code);
+    bool handle_profile_create_group(const json::object& data,
+                                     json::object& response_data,
+                                     std::string& message,
+                                     protocol_code& response_code);
     static bool handle_profile_list_friends(const json::object& data,
                                             json::object& response_data,
                                             std::string& message,

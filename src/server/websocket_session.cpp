@@ -851,6 +851,38 @@ bool parse_friend_numeric_id_from_data(const json::object& data,
     return true;
 }
 
+bool parse_numeric_id_array_from_data(const json::object& data,
+                                      const char* field,
+                                      std::vector<unsigned long long>& values,
+                                      std::string& error_message)
+{
+    values.clear();
+    const auto it = data.find(field);
+    if (it == data.end() || !it->value().is_array()) {
+        error_message = std::string("field 'data.") + field + "' is required and must be array";
+        return false;
+    }
+    const json::array& arr = it->value().as_array();
+    if (arr.empty()) {
+        error_message = std::string("field 'data.") + field + "' cannot be empty";
+        return false;
+    }
+    values.reserve(arr.size());
+    for (const json::value& item : arr) {
+        if (!item.is_string()) {
+            error_message = std::string("field 'data.") + field + "' must contain unsigned integer strings";
+            return false;
+        }
+        unsigned long long parsed = 0;
+        if (!parse_unsigned_long_long(trim_copy(std::string(item.as_string().c_str())), parsed)) {
+            error_message = std::string("field 'data.") + field + "' must contain unsigned integer strings";
+            return false;
+        }
+        values.push_back(parsed);
+    }
+    return true;
+}
+
 bool is_mysql_config_valid(const mysql_config& cfg, std::string& reason)
 {
     if (cfg.host.empty()) {
@@ -1040,7 +1072,7 @@ bool websocket_session::is_supported_action(const std::string& type, const std::
     }
     if (type == "PROFILE") {
         return action == "GET" || action == "GET_INFO" || action == "SET_INFO" || action == "UPDATE"
-            || action == "ADD_FRIEND" || action == "DELETE_FRIEND" || action == "LIST_FRIENDS"
+            || action == "ADD_FRIEND" || action == "CREATE_GROUP" || action == "DELETE_FRIEND" || action == "LIST_FRIENDS"
             || action == "LIST_CONVERSATIONS";
     }
     if (type == "MESSAGE") {
@@ -1249,6 +1281,29 @@ bool websocket_session::validate_data_schema(const std::string& type,
             }
             if (user_numeric_id == friend_numeric_id) {
                 error_message = "field 'data.user_numeric_id' and 'data.friend_numeric_id' cannot be the same";
+                error_code = protocol_code::PROFILE_VALIDATION_FAILED;
+                return false;
+            }
+            return true;
+        }
+        if (action == "CREATE_GROUP") {
+            if (!require_string_field(data, "name", error_message)) {
+                error_code = protocol_code::PROFILE_VALIDATION_FAILED;
+                return false;
+            }
+            const std::string name = trim_copy(read_string_or_empty(data, "name"));
+            if (name.empty()) {
+                error_message = "field 'data.name' cannot be empty";
+                error_code = protocol_code::PROFILE_VALIDATION_FAILED;
+                return false;
+            }
+            if (name.size() > 64U) {
+                error_message = "field 'data.name' length must be <= 64";
+                error_code = protocol_code::PROFILE_VALIDATION_FAILED;
+                return false;
+            }
+            std::vector<unsigned long long> member_numeric_ids;
+            if (!parse_numeric_id_array_from_data(data, "member_numeric_ids", member_numeric_ids, error_message)) {
                 error_code = protocol_code::PROFILE_VALIDATION_FAILED;
                 return false;
             }
@@ -2027,6 +2082,206 @@ bool websocket_session::handle_profile_add_friend(const json::object& data,
     return true;
 }
 
+bool websocket_session::handle_profile_create_group(const json::object& data,
+                                                    json::object& response_data,
+                                                    std::string& message,
+                                                    protocol_code& response_code)
+{
+    if (authenticated_user_id_ == 0ULL || authenticated_numeric_id_ == 0ULL) {
+        response_code = protocol_code::AUTH_REQUIRED;
+        message = "create group requires authenticated session";
+        return false;
+    }
+
+    const std::string name = trim_copy(read_string_or_empty(data, "name"));
+    if (name.empty()) {
+        response_code = protocol_code::PROFILE_VALIDATION_FAILED;
+        message = "field 'data.name' cannot be empty";
+        return false;
+    }
+
+    std::vector<unsigned long long> member_numeric_ids;
+    std::string parse_error;
+    if (!parse_numeric_id_array_from_data(data, "member_numeric_ids", member_numeric_ids, parse_error)) {
+        response_code = protocol_code::PROFILE_VALIDATION_FAILED;
+        message = parse_error;
+        return false;
+    }
+
+    std::sort(member_numeric_ids.begin(), member_numeric_ids.end());
+    member_numeric_ids.erase(std::unique(member_numeric_ids.begin(), member_numeric_ids.end()), member_numeric_ids.end());
+    member_numeric_ids.erase(std::remove(member_numeric_ids.begin(),
+                                         member_numeric_ids.end(),
+                                         authenticated_numeric_id_),
+                             member_numeric_ids.end());
+    if (member_numeric_ids.empty()) {
+        response_code = protocol_code::PROFILE_VALIDATION_FAILED;
+        message = "field 'data.member_numeric_ids' must contain at least one other member";
+        return false;
+    }
+
+    const mysql_config cfg = load_mysql_config();
+    response_data["debug"] = build_mysql_config_debug(cfg);
+    std::string config_error;
+    if (!is_mysql_config_valid(cfg, config_error)) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "create group failed: database config missing";
+        response_data["debug"].as_object()["config_error"] = config_error;
+        return false;
+    }
+
+    std::ostringstream members_in_sql;
+    for (std::size_t i = 0; i < member_numeric_ids.size(); ++i) {
+        if (i != 0U) {
+            members_in_sql << ", ";
+        }
+        members_in_sql << member_numeric_ids[i];
+    }
+
+    std::ostringstream member_lookup_sql;
+    member_lookup_sql << "SELECT id, numeric_id, username "
+                      << "FROM user_data "
+                      << "WHERE numeric_id IN (" << members_in_sql.str() << ") "
+                      << "ORDER BY numeric_id ASC;";
+
+    std::string command_output;
+    int exit_code = 0;
+    if (!run_mysql_sql(cfg, member_lookup_sql.str(), command_output, exit_code)) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "create group failed in database";
+        response_data["debug"].as_object()["mysql_exit_code"] = exit_code;
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    const std::vector<std::string> member_lines = collect_non_empty_lines(command_output);
+    if (member_lines.size() != member_numeric_ids.size()) {
+        response_code = protocol_code::PROFILE_NOT_FOUND;
+        message = "group member not found";
+        response_data["missing_member_count"] =
+            static_cast<std::uint64_t>(member_numeric_ids.size() - member_lines.size());
+        return false;
+    }
+
+    struct group_member_summary
+    {
+        unsigned long long user_id = 0;
+        unsigned long long numeric_id = 0;
+        std::string username;
+    };
+
+    std::vector<group_member_summary> members;
+    members.reserve(member_lines.size());
+    for (const std::string& line : member_lines) {
+        const std::vector<std::string> cols = split_by_tab(trim_copy(line));
+        if (cols.size() < 3U) {
+            response_code = protocol_code::INTERNAL_ERROR;
+            message = "create group failed: unexpected database output";
+            response_data["debug"].as_object()["mysql_output"] = command_output;
+            return false;
+        }
+        group_member_summary item;
+        if (!parse_unsigned_long_long(cols[0], item.user_id)
+            || !parse_unsigned_long_long(cols[1], item.numeric_id)
+            || item.user_id == 0ULL
+            || item.numeric_id == 0ULL) {
+            response_code = protocol_code::INTERNAL_ERROR;
+            message = "create group failed: unexpected database output";
+            response_data["debug"].as_object()["mysql_output"] = command_output;
+            return false;
+        }
+        item.username = (cols[2] == "\\N") ? "" : cols[2];
+        members.push_back(std::move(item));
+    }
+
+    const std::string conversation_uuid = generate_uuid_v4_like();
+    std::ostringstream member_insert_sql;
+    member_insert_sql << "(@conversation_id, " << authenticated_user_id_ << ", 2)";
+    for (const group_member_summary& member : members) {
+        member_insert_sql << ", (@conversation_id, " << member.user_id << ", 0)";
+    }
+
+    std::ostringstream create_sql;
+    create_sql << "START TRANSACTION; "
+               << "INSERT INTO conversations (conversation_uuid, type, owner_user_id, name, avatar_url, notice, last_message_id) VALUES ("
+               << "'" << sql_escape(conversation_uuid) << "', "
+               << "2, "
+               << authenticated_user_id_ << ", "
+               << "'" << sql_escape(name) << "', "
+               << "NULL, NULL, NULL); "
+               << "SET @conversation_id := LAST_INSERT_ID(); "
+               << "INSERT INTO conversation_members (conversation_id, user_id, role) VALUES "
+               << member_insert_sql.str() << "; "
+               << "SELECT id, conversation_uuid FROM conversations WHERE id=@conversation_id LIMIT 1; "
+               << "COMMIT;";
+
+    command_output.clear();
+    exit_code = 0;
+    if (!run_mysql_sql(cfg, create_sql.str(), command_output, exit_code)) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "create group failed in database";
+        response_data["debug"].as_object()["mysql_exit_code"] = exit_code;
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    const std::vector<std::string> create_lines = collect_non_empty_lines(command_output);
+    if (create_lines.empty()) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "create group failed: unexpected database output";
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    const std::vector<std::string> conversation_cols = split_by_tab(trim_copy(create_lines.back()));
+    unsigned long long internal_conversation_id = 0ULL;
+    std::string stored_conversation_uuid;
+    if (conversation_cols.size() < 2U
+        || !parse_unsigned_long_long(conversation_cols[0], internal_conversation_id)
+        || internal_conversation_id == 0ULL) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "create group failed: unexpected database output";
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+    stored_conversation_uuid = trim_copy(conversation_cols[1]);
+    if (stored_conversation_uuid.empty()) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "create group failed: missing conversation id";
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    json::array response_members;
+    json::object owner_item;
+    owner_item["user_id"] = std::to_string(authenticated_user_id_);
+    owner_item["numeric_id"] = std::to_string(authenticated_numeric_id_);
+    owner_item["username"] = authenticated_username_;
+    owner_item["role"] = 2;
+    response_members.push_back(std::move(owner_item));
+    for (const group_member_summary& member : members) {
+        json::object member_item;
+        member_item["user_id"] = std::to_string(member.user_id);
+        member_item["numeric_id"] = std::to_string(member.numeric_id);
+        member_item["username"] = member.username;
+        member_item["role"] = 0;
+        response_members.push_back(std::move(member_item));
+    }
+
+    response_data["conversation_id"] = stored_conversation_uuid;
+    response_data["conversation_uuid"] = stored_conversation_uuid;
+    response_data["conversation_type"] = 2;
+    response_data["internal_conversation_id"] = std::to_string(internal_conversation_id);
+    response_data["name"] = name;
+    response_data["owner_user_id"] = std::to_string(authenticated_user_id_);
+    response_data["owner_numeric_id"] = std::to_string(authenticated_numeric_id_);
+    response_data["member_count"] = static_cast<std::uint64_t>(response_members.size());
+    response_data["members"] = std::move(response_members);
+    response_code = protocol_code::OK;
+    message = "group created";
+    return true;
+}
+
 bool websocket_session::handle_profile_list_friends(const json::object& data,
                                                     json::object& response_data,
                                                     std::string& message,
@@ -2314,6 +2569,72 @@ bool websocket_session::handle_profile_list_conversations(const json::object& da
         item["peer_status"] = static_cast<int>(user_status);
         item["peer_is_online"] = (is_online != 0ULL);
         item["peer_last_seen_at"] = peer_last_seen_at;
+        conversations.push_back(std::move(item));
+    }
+
+    std::ostringstream group_sql;
+    group_sql << "SELECT "
+              << "c.conversation_uuid, "
+              << "COALESCE(c.name, ''), "
+              << "COALESCE(c.avatar_url, ''), "
+              << "COALESCE(c.notice, ''), "
+              << "cm.role, "
+              << "(SELECT COUNT(*) FROM conversation_members x WHERE x.conversation_id=c.id), "
+              << "COALESCE(DATE_FORMAT(c.updated_at, '%Y-%m-%dT%H:%i:%sZ'), '') "
+              << "FROM conversations c "
+              << "JOIN conversation_members cm ON cm.conversation_id=c.id "
+              << "WHERE cm.user_id=" << requester_user_id << " "
+              << "AND c.type=2 "
+              << "ORDER BY c.updated_at DESC, c.id DESC;";
+
+    command_output.clear();
+    exit_code = 0;
+    if (!run_mysql_sql(cfg, group_sql.str(), command_output, exit_code)) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "list conversations failed in database";
+        response_data["debug"].as_object()["mysql_exit_code"] = exit_code;
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    const std::vector<std::string> group_lines = collect_non_empty_lines(command_output);
+    for (const std::string& line : group_lines) {
+        const std::vector<std::string> cols = split_by_tab(trim_copy(line));
+        if (cols.size() < 7U) {
+            response_code = protocol_code::INTERNAL_ERROR;
+            message = "list conversations failed: unexpected database output";
+            response_data["debug"].as_object()["mysql_output"] = command_output;
+            return false;
+        }
+        unsigned long long role = 0ULL;
+        unsigned long long member_count = 0ULL;
+        if (!parse_unsigned_long_long(cols[4], role)
+            || !parse_unsigned_long_long(cols[5], member_count)) {
+            response_code = protocol_code::INTERNAL_ERROR;
+            message = "list conversations failed: unexpected database output";
+            response_data["debug"].as_object()["mysql_output"] = command_output;
+            return false;
+        }
+
+        json::object item;
+        item["conversation_id"] = cols[0];
+        item["conversation_uuid"] = cols[0];
+        item["conversation_type"] = 2;
+        item["name"] = (cols[1] == "\\N") ? "" : cols[1];
+        item["avatar_url"] = (cols[2] == "\\N") ? "" : cols[2];
+        item["notice"] = (cols[3] == "\\N") ? "" : cols[3];
+        item["role"] = static_cast<int>(role);
+        item["member_count"] = static_cast<std::uint64_t>(member_count);
+        item["updated_at"] = (cols[6] == "\\N") ? "" : cols[6];
+        item["peer_user_id"] = "";
+        item["peer_numeric_id"] = "";
+        item["peer_username"] = "";
+        item["peer_nickname"] = "";
+        item["peer_avatar_url"] = "";
+        item["peer_bio"] = "";
+        item["peer_status"] = 0;
+        item["peer_is_online"] = false;
+        item["peer_last_seen_at"] = "";
         conversations.push_back(std::move(item));
     }
 
@@ -3150,6 +3471,8 @@ void websocket_session::on_read(
             ok = handle_profile_set_info(request.data, response_data, message, response_code);
         } else if (request.type == "PROFILE" && request.action == "ADD_FRIEND") {
             ok = handle_profile_add_friend(request.data, response_data, message, response_code);
+        } else if (request.type == "PROFILE" && request.action == "CREATE_GROUP") {
+            ok = handle_profile_create_group(request.data, response_data, message, response_code);
         } else if (request.type == "PROFILE" && request.action == "LIST_FRIENDS") {
             ok = handle_profile_list_friends(request.data, response_data, message, response_code);
         } else if (request.type == "PROFILE" && request.action == "LIST_CONVERSATIONS") {
