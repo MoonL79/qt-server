@@ -125,6 +125,10 @@ private:
                                    json::object& response_data,
                                    std::string& message,
                                    protocol_code& response_code);
+    bool handle_profile_leave_group(const json::object& data,
+                                    json::object& response_data,
+                                    std::string& message,
+                                    protocol_code& response_code);
     bool handle_profile_list_groups(const json::object& data,
                                     json::object& response_data,
                                     std::string& message,
