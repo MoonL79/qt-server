@@ -7,6 +7,7 @@
 #include <boost/beast/version.hpp>
 #include "upload_token_store.hpp"
 #include <memory>
+#include <cstddef>
 #include <string>
 #include <utility>
 
@@ -35,6 +36,13 @@ private:
         std::string filename;
     };
 
+    struct chat_file_upload_form
+    {
+        std::string user_id;
+        std::string conversation_id;
+        multipart_file_part file_part;
+    };
+
     void do_read();
     void on_read(beast::error_code ec, std::size_t bytes_transferred);
 
@@ -53,11 +61,16 @@ private:
     void on_write(beast::error_code ec);
     void handle_request();
     void handle_upload_avatar();
+    void handle_upload_chat_file();
+    void handle_download_chat_file(const std::string& file_id);
     void send_json_response(http::status status, bool ok, const std::string& message, const std::string& avatar_url = "");
+    void send_json_payload(http::status status, const std::string& body);
     bool parse_authorization_bearer(std::string& token) const;
     bool parse_multipart_avatar(std::string& user_id,
                                 multipart_file_part& file_part,
                                 std::string& error_message) const;
+    bool parse_multipart_chat_file(chat_file_upload_form& form,
+                                   std::string& error_message) const;
     static bool parse_boundary_from_content_type(const std::string& content_type, std::string& boundary);
     static bool is_unsigned_integer_text(const std::string& value);
     static std::string trim_copy(const std::string& input);
@@ -69,9 +82,13 @@ private:
     static bool infer_extension(const std::string& content_type,
                                 const std::string& filename,
                                 std::string& extension);
+    static std::string infer_generic_extension(const std::string& content_type,
+                                               const std::string& filename);
+    static std::string sanitize_filename(const std::string& filename);
     static bool ensure_directory_tree(const std::string& path);
     static bool cleanup_old_avatar_files(const std::string& avatar_dir, const std::string& user_id);
     std::string build_avatar_absolute_url(const std::string& filename) const;
+    static std::string compute_sha256_hex(const std::string& data);
 
 private:
     tcp::socket socket_;

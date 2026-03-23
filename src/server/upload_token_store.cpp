@@ -16,6 +16,7 @@ namespace {
 struct token_entry
 {
     unsigned long long user_id = 0ULL;
+    std::string purpose;
     std::chrono::system_clock::time_point expires_at;
 };
 
@@ -69,11 +70,12 @@ void cleanup_expired_locked(const std::chrono::system_clock::time_point now)
 } // namespace
 
 bool issue_upload_token(unsigned long long user_id,
+                        const std::string& purpose,
                         int ttl_seconds,
                         std::string& out_token,
                         std::string& out_expires_at_utc)
 {
-    if (user_id == 0ULL || ttl_seconds <= 0) {
+    if (user_id == 0ULL || ttl_seconds <= 0 || purpose.empty()) {
         return false;
     }
 
@@ -83,11 +85,12 @@ bool issue_upload_token(unsigned long long user_id,
 
     std::lock_guard<std::mutex> lock(g_upload_tokens_mutex);
     cleanup_expired_locked(std::chrono::system_clock::now());
-    g_upload_tokens[out_token] = token_entry{user_id, expires_at};
+    g_upload_tokens[out_token] = token_entry{user_id, purpose, expires_at};
     return true;
 }
 
 bool validate_upload_token(const std::string& token,
+                           const std::string& required_purpose,
                            unsigned long long& out_user_id,
                            std::string& error_message)
 {
@@ -110,6 +113,10 @@ bool validate_upload_token(const std::string& token,
     if (it->second.expires_at <= now) {
         g_upload_tokens.erase(it);
         error_message = "token expired";
+        return false;
+    }
+    if (!required_purpose.empty() && it->second.purpose != required_purpose) {
+        error_message = "token purpose mismatch";
         return false;
     }
     out_user_id = it->second.user_id;
