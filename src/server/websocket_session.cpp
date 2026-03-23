@@ -1073,7 +1073,7 @@ bool websocket_session::is_supported_action(const std::string& type, const std::
     if (type == "PROFILE") {
         return action == "GET" || action == "GET_INFO" || action == "SET_INFO" || action == "UPDATE"
             || action == "ADD_FRIEND" || action == "CREATE_GROUP" || action == "DELETE_FRIEND" || action == "JOIN_GROUP"
-            || action == "LEAVE_GROUP" || action == "LIST_FRIENDS"
+            || action == "LEAVE_GROUP" || action == "DISMISS_GROUP" || action == "LIST_FRIENDS"
             || action == "LIST_CONVERSATIONS" || action == "LIST_GROUPS";
     }
     if (type == "MESSAGE") {
@@ -1334,6 +1334,29 @@ bool websocket_session::validate_data_schema(const std::string& type,
             return true;
         }
         if (action == "LEAVE_GROUP") {
+            if (!validate_optional_string_max_len(data, "group_numeric_id", 32, error_message)
+                || !validate_optional_string_max_len(data, "conversation_id", 64, error_message)) {
+                error_code = protocol_code::PROFILE_VALIDATION_FAILED;
+                return false;
+            }
+            const std::string group_numeric_id_text = trim_copy(read_string_or_empty(data, "group_numeric_id"));
+            const std::string conversation_id = trim_copy(read_string_or_empty(data, "conversation_id"));
+            if (group_numeric_id_text.empty() && conversation_id.empty()) {
+                error_message = "field 'data.group_numeric_id' or 'data.conversation_id' is required";
+                error_code = protocol_code::PROFILE_VALIDATION_FAILED;
+                return false;
+            }
+            if (!group_numeric_id_text.empty()) {
+                unsigned long long group_numeric_id = 0;
+                if (!parse_unsigned_long_long(group_numeric_id_text, group_numeric_id)) {
+                    error_message = "field 'data.group_numeric_id' must be unsigned integer string";
+                    error_code = protocol_code::PROFILE_VALIDATION_FAILED;
+                    return false;
+                }
+            }
+            return true;
+        }
+        if (action == "DISMISS_GROUP") {
             if (!validate_optional_string_max_len(data, "group_numeric_id", 32, error_message)
                 || !validate_optional_string_max_len(data, "conversation_id", 64, error_message)) {
                 error_code = protocol_code::PROFILE_VALIDATION_FAILED;
@@ -2340,6 +2363,19 @@ bool websocket_session::handle_profile_create_group(const json::object& data,
     response_data["owner_numeric_id"] = std::to_string(authenticated_numeric_id_);
     response_data["member_count"] = static_cast<std::uint64_t>(response_members.size());
     response_data["members"] = std::move(response_members);
+    std::vector<std::uint64_t> member_user_ids;
+    member_user_ids.reserve(members.size() + 1U);
+    member_user_ids.push_back(authenticated_user_id_);
+    for (const group_member_summary& member : members) {
+        member_user_ids.push_back(member.user_id);
+    }
+    broadcast_group_created_to_members(member_user_ids,
+                                       stored_conversation_uuid,
+                                       group_numeric_id,
+                                       name,
+                                       authenticated_user_id_,
+                                       authenticated_numeric_id_,
+                                       response_data["members"].as_array());
     response_code = protocol_code::OK;
     message = "group created";
     return true;
@@ -2676,6 +2712,231 @@ bool websocket_session::handle_profile_leave_group(const json::object& data,
     response_data["left_numeric_id"] = std::to_string(authenticated_numeric_id_);
     response_code = protocol_code::OK;
     message = "group left";
+    return true;
+}
+
+bool websocket_session::handle_profile_dismiss_group(const json::object& data,
+                                                     json::object& response_data,
+                                                     std::string& message,
+                                                     protocol_code& response_code)
+{
+    if (authenticated_user_id_ == 0ULL || authenticated_numeric_id_ == 0ULL) {
+        response_code = protocol_code::AUTH_REQUIRED;
+        message = "dismiss group requires authenticated session";
+        return false;
+    }
+
+    const std::string group_numeric_id_text = trim_copy(read_string_or_empty(data, "group_numeric_id"));
+    const std::string conversation_id = trim_copy(read_string_or_empty(data, "conversation_id"));
+    unsigned long long group_numeric_id = 0ULL;
+    const bool has_group_numeric_id = !group_numeric_id_text.empty()
+        && parse_unsigned_long_long(group_numeric_id_text, group_numeric_id);
+    if (!has_group_numeric_id && conversation_id.empty()) {
+        response_code = protocol_code::PROFILE_VALIDATION_FAILED;
+        message = "field 'data.group_numeric_id' or 'data.conversation_id' is required";
+        return false;
+    }
+
+    const mysql_config cfg = load_mysql_config();
+    response_data["debug"] = build_mysql_config_debug(cfg);
+    std::string config_error;
+    if (!is_mysql_config_valid(cfg, config_error)) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "dismiss group failed: database config missing";
+        response_data["debug"].as_object()["config_error"] = config_error;
+        return false;
+    }
+
+    std::ostringstream find_sql;
+    find_sql << "SELECT "
+             << "c.id, "
+             << "c.conversation_uuid, "
+             << "COALESCE(c.group_numeric_id, 0), "
+             << "COALESCE(c.name, ''), "
+             << "COALESCE(c.owner_user_id, 0), "
+             << "(SELECT COUNT(*) FROM conversation_members x WHERE x.conversation_id=c.id), "
+             << "CASE WHEN EXISTS(SELECT 1 FROM conversation_members me WHERE me.conversation_id=c.id AND me.user_id="
+             << authenticated_user_id_ << ") THEN 1 ELSE 0 END "
+             << "FROM conversations c "
+             << "WHERE c.type=2 ";
+    if (has_group_numeric_id && !conversation_id.empty()) {
+        find_sql << "AND (c.group_numeric_id=" << group_numeric_id
+                 << " OR c.conversation_uuid='" << sql_escape(conversation_id) << "') ";
+    } else if (has_group_numeric_id) {
+        find_sql << "AND c.group_numeric_id=" << group_numeric_id << " ";
+    } else {
+        find_sql << "AND c.conversation_uuid='" << sql_escape(conversation_id) << "' ";
+    }
+    find_sql << "ORDER BY c.id DESC LIMIT 1;";
+
+    std::string command_output;
+    int exit_code = 0;
+    if (!run_mysql_sql(cfg, find_sql.str(), command_output, exit_code)) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "dismiss group failed in database";
+        response_data["debug"].as_object()["mysql_exit_code"] = exit_code;
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    const std::vector<std::string> lines = collect_non_empty_lines(command_output);
+    if (lines.empty()) {
+        response_code = protocol_code::PROFILE_NOT_FOUND;
+        message = "group not found";
+        response_data["group_numeric_id"] = group_numeric_id_text;
+        response_data["conversation_id"] = conversation_id;
+        return false;
+    }
+
+    const std::vector<std::string> cols = split_by_tab(trim_copy(lines.front()));
+    unsigned long long internal_conversation_id = 0ULL;
+    unsigned long long stored_group_numeric_id = 0ULL;
+    unsigned long long owner_user_id = 0ULL;
+    unsigned long long member_count = 0ULL;
+    unsigned long long is_member = 0ULL;
+    if (cols.size() < 7U
+        || !parse_unsigned_long_long(cols[0], internal_conversation_id)
+        || !parse_unsigned_long_long(cols[2], stored_group_numeric_id)
+        || !parse_unsigned_long_long(cols[4], owner_user_id)
+        || !parse_unsigned_long_long(cols[5], member_count)
+        || !parse_unsigned_long_long(cols[6], is_member)
+        || internal_conversation_id == 0ULL
+        || stored_group_numeric_id == 0ULL) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "dismiss group failed: unexpected database output";
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    const std::string stored_conversation_uuid = (cols[1] == "\\N") ? "" : cols[1];
+    const std::string group_name = (cols[3] == "\\N") ? "" : cols[3];
+    if (stored_conversation_uuid.empty()) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "dismiss group failed: missing conversation id";
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    response_data["conversation_id"] = stored_conversation_uuid;
+    response_data["conversation_uuid"] = stored_conversation_uuid;
+    response_data["group_numeric_id"] = std::to_string(stored_group_numeric_id);
+    response_data["conversation_type"] = 2;
+    response_data["name"] = group_name;
+    response_data["owner_user_id"] = std::to_string(owner_user_id);
+    response_data["member_count"] = static_cast<std::uint64_t>(member_count);
+
+    if (owner_user_id != authenticated_user_id_) {
+        response_code = protocol_code::PERMISSION_DENIED;
+        message = "dismiss group requires group owner";
+        return false;
+    }
+
+    if (is_member == 0ULL) {
+        response_code = protocol_code::PERMISSION_DENIED;
+        message = "group owner is not a group member";
+        return false;
+    }
+
+    std::ostringstream members_sql;
+    members_sql << "SELECT user_id "
+                << "FROM conversation_members "
+                << "WHERE conversation_id=" << internal_conversation_id << " "
+                << "ORDER BY user_id ASC;";
+
+    command_output.clear();
+    exit_code = 0;
+    if (!run_mysql_sql(cfg, members_sql.str(), command_output, exit_code)) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "dismiss group failed in database";
+        response_data["debug"].as_object()["mysql_exit_code"] = exit_code;
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    const std::vector<std::string> member_lines = collect_non_empty_lines(command_output);
+    std::vector<std::uint64_t> member_user_ids;
+    member_user_ids.reserve(member_lines.size());
+    for (const std::string& line : member_lines) {
+        unsigned long long member_user_id = 0ULL;
+        if (!parse_unsigned_long_long(trim_copy(line), member_user_id) || member_user_id == 0ULL) {
+            response_code = protocol_code::INTERNAL_ERROR;
+            message = "dismiss group failed: unexpected member output";
+            response_data["debug"].as_object()["mysql_output"] = command_output;
+            return false;
+        }
+        member_user_ids.push_back(member_user_id);
+    }
+
+    std::ostringstream dismiss_sql;
+    dismiss_sql << "START TRANSACTION; "
+                << "DELETE FROM message_receipts "
+                << "WHERE message_id IN (SELECT id FROM messages WHERE conversation_id=" << internal_conversation_id << "); "
+                << "SELECT ROW_COUNT(); "
+                << "DELETE FROM messages WHERE conversation_id=" << internal_conversation_id << "; "
+                << "SELECT ROW_COUNT(); "
+                << "DELETE FROM conversation_members WHERE conversation_id=" << internal_conversation_id << "; "
+                << "SELECT ROW_COUNT(); "
+                << "DELETE FROM conversations WHERE id=" << internal_conversation_id << " AND owner_user_id="
+                << authenticated_user_id_ << "; "
+                << "SELECT ROW_COUNT(); "
+                << "COMMIT;";
+
+    command_output.clear();
+    exit_code = 0;
+    if (!run_mysql_sql(cfg, dismiss_sql.str(), command_output, exit_code)) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "dismiss group failed in database";
+        response_data["debug"].as_object()["mysql_exit_code"] = exit_code;
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    const std::vector<std::string> dismiss_lines = collect_non_empty_lines(command_output);
+    if (dismiss_lines.size() < 4U) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "dismiss group failed: unexpected database output";
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    unsigned long long deleted_receipt_rows = 0ULL;
+    unsigned long long deleted_message_rows = 0ULL;
+    unsigned long long deleted_member_rows = 0ULL;
+    unsigned long long deleted_conversation_rows = 0ULL;
+    if (!parse_unsigned_long_long(trim_copy(dismiss_lines[dismiss_lines.size() - 4U]), deleted_receipt_rows)
+        || !parse_unsigned_long_long(trim_copy(dismiss_lines[dismiss_lines.size() - 3U]), deleted_message_rows)
+        || !parse_unsigned_long_long(trim_copy(dismiss_lines[dismiss_lines.size() - 2U]), deleted_member_rows)
+        || !parse_unsigned_long_long(trim_copy(dismiss_lines.back()), deleted_conversation_rows)) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "dismiss group failed: unexpected database output";
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    if (deleted_conversation_rows == 0ULL) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "dismiss group failed: conversation not deleted";
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    response_data["dismissed"] = true;
+    response_data["dismissed_by_user_id"] = std::to_string(authenticated_user_id_);
+    response_data["dismissed_by_numeric_id"] = std::to_string(authenticated_numeric_id_);
+    response_data["deleted_receipt_rows"] = static_cast<std::uint64_t>(deleted_receipt_rows);
+    response_data["deleted_message_rows"] = static_cast<std::uint64_t>(deleted_message_rows);
+    response_data["deleted_member_rows"] = static_cast<std::uint64_t>(deleted_member_rows);
+    response_data["deleted_conversation_rows"] = static_cast<std::uint64_t>(deleted_conversation_rows);
+    response_data["member_count"] = 0;
+    broadcast_group_dismissed_to_members(member_user_ids,
+                                         stored_conversation_uuid,
+                                         stored_group_numeric_id,
+                                         group_name,
+                                         owner_user_id,
+                                         authenticated_user_id_,
+                                         authenticated_numeric_id_);
+    response_code = protocol_code::OK;
+    message = "group dismissed";
     return true;
 }
 
@@ -3705,7 +3966,7 @@ void websocket_session::broadcast_presence_to_friends(std::uint64_t user_id,
 
     const std::string payload = build_response_payload("MESSAGE",
                                                        "PRESENCE",
-                                                       "",
+                                                       generate_uuid_v4_like(),
                                                        protocol_code::OK,
                                                        true,
                                                        "friend presence changed",
@@ -3726,6 +3987,131 @@ void websocket_session::broadcast_presence_to_friends(std::uint64_t user_id,
               << " numeric_id=" << numeric_id
               << " is_online=" << (is_online ? "true" : "false")
               << " friends=" << friend_user_ids.size()
+              << " delivered_sessions=" << delivered_sessions
+              << std::endl;
+}
+
+void websocket_session::broadcast_group_dismissed_to_members(const std::vector<std::uint64_t>& member_user_ids,
+                                                             const std::string& conversation_id,
+                                                             std::uint64_t group_numeric_id,
+                                                             const std::string& group_name,
+                                                             std::uint64_t owner_user_id,
+                                                             std::uint64_t dismissed_by_user_id,
+                                                             std::uint64_t dismissed_by_numeric_id)
+{
+    if (member_user_ids.empty() || conversation_id.empty() || group_numeric_id == 0ULL) {
+        return;
+    }
+
+    json::object data;
+    data["conversation_id"] = conversation_id;
+    data["conversation_uuid"] = conversation_id;
+    data["group_numeric_id"] = std::to_string(group_numeric_id);
+    data["conversation_type"] = 2;
+    data["name"] = group_name;
+    data["avatar_url"] = "";
+    data["notice"] = "";
+    data["updated_at"] = now_utc_iso8601();
+    data["peer_user_id"] = "";
+    data["peer_numeric_id"] = "";
+    data["peer_username"] = "";
+    data["peer_nickname"] = "";
+    data["peer_avatar_url"] = "";
+    data["peer_bio"] = "";
+    data["peer_status"] = 0;
+    data["peer_is_online"] = false;
+    data["peer_last_seen_at"] = "";
+    data["owner_user_id"] = std::to_string(owner_user_id);
+    data["member_count"] = 0;
+    data["dismissed"] = true;
+    data["dismissed_by_user_id"] = std::to_string(dismissed_by_user_id);
+    data["dismissed_by_numeric_id"] = std::to_string(dismissed_by_numeric_id);
+    data["refresh_hint"] = "remove_group_conversation";
+
+    const std::string payload = build_response_payload("PROFILE",
+                                                       "DISMISS_GROUP",
+                                                       generate_uuid_v4_like(),
+                                                       protocol_code::OK,
+                                                       true,
+                                                       "group dismissed event",
+                                                       std::move(data));
+
+    std::size_t delivered_sessions = 0U;
+    for (std::uint64_t member_user_id : member_user_ids) {
+        const std::vector<std::shared_ptr<websocket_session>> sessions =
+            snapshot_authenticated_sessions(member_user_id);
+        for (const std::shared_ptr<websocket_session>& session : sessions) {
+            session->queue_outbound_message(payload);
+            ++delivered_sessions;
+        }
+    }
+
+    std::cout << "[group] broadcast dismissed"
+              << " conversation_id=" << conversation_id
+              << " group_numeric_id=" << group_numeric_id
+              << " members=" << member_user_ids.size()
+              << " delivered_sessions=" << delivered_sessions
+              << std::endl;
+}
+
+void websocket_session::broadcast_group_created_to_members(const std::vector<std::uint64_t>& member_user_ids,
+                                                           const std::string& conversation_id,
+                                                           std::uint64_t group_numeric_id,
+                                                           const std::string& group_name,
+                                                           std::uint64_t owner_user_id,
+                                                           std::uint64_t owner_numeric_id,
+                                                           const json::array& members)
+{
+    if (member_user_ids.empty() || conversation_id.empty() || group_numeric_id == 0ULL) {
+        return;
+    }
+
+    json::object data;
+    data["conversation_id"] = conversation_id;
+    data["conversation_uuid"] = conversation_id;
+    data["group_numeric_id"] = std::to_string(group_numeric_id);
+    data["conversation_type"] = 2;
+    data["name"] = group_name;
+    data["avatar_url"] = "";
+    data["notice"] = "";
+    data["updated_at"] = now_utc_iso8601();
+    data["peer_user_id"] = "";
+    data["peer_numeric_id"] = "";
+    data["peer_username"] = "";
+    data["peer_nickname"] = "";
+    data["peer_avatar_url"] = "";
+    data["peer_bio"] = "";
+    data["peer_status"] = 0;
+    data["peer_is_online"] = false;
+    data["peer_last_seen_at"] = "";
+    data["owner_user_id"] = std::to_string(owner_user_id);
+    data["owner_numeric_id"] = std::to_string(owner_numeric_id);
+    data["member_count"] = static_cast<std::uint64_t>(members.size());
+    data["members"] = members;
+    data["refresh_hint"] = "append_group_conversation";
+
+    const std::string payload = build_response_payload("PROFILE",
+                                                       "CREATE_GROUP",
+                                                       generate_uuid_v4_like(),
+                                                       protocol_code::OK,
+                                                       true,
+                                                       "group created event",
+                                                       std::move(data));
+
+    std::size_t delivered_sessions = 0U;
+    for (std::uint64_t member_user_id : member_user_ids) {
+        const std::vector<std::shared_ptr<websocket_session>> sessions =
+            snapshot_authenticated_sessions(member_user_id);
+        for (const std::shared_ptr<websocket_session>& session : sessions) {
+            session->queue_outbound_message(payload);
+            ++delivered_sessions;
+        }
+    }
+
+    std::cout << "[group] broadcast created"
+              << " conversation_id=" << conversation_id
+              << " group_numeric_id=" << group_numeric_id
+              << " members=" << member_user_ids.size()
               << " delivered_sessions=" << delivered_sessions
               << std::endl;
 }
@@ -4011,6 +4397,8 @@ void websocket_session::on_read(
             ok = handle_profile_join_group(request.data, response_data, message, response_code);
         } else if (request.type == "PROFILE" && request.action == "LEAVE_GROUP") {
             ok = handle_profile_leave_group(request.data, response_data, message, response_code);
+        } else if (request.type == "PROFILE" && request.action == "DISMISS_GROUP") {
+            ok = handle_profile_dismiss_group(request.data, response_data, message, response_code);
         } else if (request.type == "PROFILE" && request.action == "LIST_FRIENDS") {
             ok = handle_profile_list_friends(request.data, response_data, message, response_code);
         } else if (request.type == "PROFILE" && request.action == "LIST_CONVERSATIONS") {
@@ -4060,6 +4448,12 @@ void websocket_session::on_write(
 
     if(ec) {
         std::cerr << "write: " << ec.message() << std::endl;
+        std::cout << "[ws] write failed"
+                  << " session=" << static_cast<const void*>(this)
+                  << " remote=" << remote_endpoint_
+                  << " pending=" << pending_writes_.size()
+                  << " error=" << ec.message()
+                  << std::endl;
         write_in_progress_ = false;
         pending_writes_.clear();
         return;
