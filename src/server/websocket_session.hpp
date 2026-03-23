@@ -129,6 +129,10 @@ private:
                                     json::object& response_data,
                                     std::string& message,
                                     protocol_code& response_code);
+    bool handle_profile_dismiss_group(const json::object& data,
+                                      json::object& response_data,
+                                      std::string& message,
+                                      protocol_code& response_code);
     bool handle_profile_list_groups(const json::object& data,
                                     json::object& response_data,
                                     std::string& message,
@@ -171,6 +175,20 @@ private:
                                               bool is_online,
                                               const std::string& last_seen_at,
                                               const char* presence_event);
+    static void broadcast_group_dismissed_to_members(const std::vector<std::uint64_t>& member_user_ids,
+                                                     const std::string& conversation_id,
+                                                     std::uint64_t group_numeric_id,
+                                                     const std::string& group_name,
+                                                     std::uint64_t owner_user_id,
+                                                     std::uint64_t dismissed_by_user_id,
+                                                     std::uint64_t dismissed_by_numeric_id);
+    static void broadcast_group_created_to_members(const std::vector<std::uint64_t>& member_user_ids,
+                                                   const std::string& conversation_id,
+                                                   std::uint64_t group_numeric_id,
+                                                   const std::string& group_name,
+                                                   std::uint64_t owner_user_id,
+                                                   std::uint64_t owner_numeric_id,
+                                                   const json::array& members);
     void bind_authenticated_user(std::uint64_t user_id,
                                  std::uint64_t numeric_id,
                                  const std::string& username,
