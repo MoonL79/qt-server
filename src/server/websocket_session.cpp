@@ -1,4 +1,5 @@
 #include "server/websocket_session.hpp"
+#include "server/chat_file_store.hpp"
 #include "server/upload_token_store.hpp"
 #include <boost/beast/core/buffers_to_string.hpp>
 #include <algorithm>
@@ -30,6 +31,10 @@ std::mutex g_presence_mutex;
 std::unordered_map<unsigned long long, std::size_t> g_online_session_counts;
 std::mutex g_authenticated_sessions_mutex;
 std::unordered_map<unsigned long long, std::vector<std::weak_ptr<websocket_session>>> g_authenticated_sessions;
+const char* k_avatar_upload_purpose = "avatar_upload";
+const char* k_chat_file_token_purpose = "chat_file";
+const unsigned long long k_text_message_type = 1ULL;
+const unsigned long long k_file_message_type = 2ULL;
 
 struct mysql_config
 {
@@ -544,6 +549,15 @@ std::string read_string_or_empty(const json::object& obj, const char* field)
         return "";
     }
     return std::string(it->value().as_string().c_str());
+}
+
+const json::object* read_object_field(const json::object& obj, const char* field)
+{
+    const auto it = obj.find(field);
+    if (it == obj.end() || !it->value().is_object()) {
+        return nullptr;
+    }
+    return &it->value().as_object();
 }
 
 std::string now_utc_iso8601()
@@ -1435,12 +1449,57 @@ bool websocket_session::validate_data_schema(const std::string& type,
 
     if (type == "MESSAGE") {
         if (action == "SEND") {
-            if (!require_string_field(data, "conversation_id", error_message)
-                || !require_string_field(data, "content", error_message)) {
+            if (!require_string_field(data, "conversation_id", error_message)) {
                 error_code = protocol_code::MESSAGE_INVALID;
                 return false;
             }
-            return true;
+            const std::string message_kind = trim_copy(read_string_or_empty(data, "message_kind"));
+            if (message_kind.empty() || message_kind == "text") {
+                if (!require_string_field(data, "content", error_message)) {
+                    error_code = protocol_code::MESSAGE_INVALID;
+                    return false;
+                }
+                return true;
+            }
+            if (message_kind == "file") {
+                const json::object* file = read_object_field(data, "file");
+                if (file == nullptr) {
+                    error_message = "field 'data.file' is required and must be object when message_kind=file";
+                    error_code = protocol_code::MESSAGE_INVALID;
+                    return false;
+                }
+                if (!require_string_field(*file, "file_id", error_message)) {
+                    error_message = "field 'data.file.file_id' is required and must be string";
+                    error_code = protocol_code::MESSAGE_INVALID;
+                    return false;
+                }
+                if (!require_string_field(*file, "original_name", error_message)) {
+                    error_message = "field 'data.file.original_name' is required and must be string";
+                    error_code = protocol_code::MESSAGE_INVALID;
+                    return false;
+                }
+                if (!require_string_field(*file, "content_type", error_message)) {
+                    error_message = "field 'data.file.content_type' is required and must be string";
+                    error_code = protocol_code::MESSAGE_INVALID;
+                    return false;
+                }
+                if (!require_string_field(*file, "sha256", error_message)) {
+                    error_message = "field 'data.file.sha256' is required and must be string";
+                    error_code = protocol_code::MESSAGE_INVALID;
+                    return false;
+                }
+                const auto size_it = file->find("size_bytes");
+                if (size_it == file->end()
+                    || (!size_it->value().is_int64() && !size_it->value().is_uint64() && !size_it->value().is_double())) {
+                    error_message = "field 'data.file.size_bytes' is required and must be number";
+                    error_code = protocol_code::MESSAGE_INVALID;
+                    return false;
+                }
+                return true;
+            }
+            error_message = "field 'data.message_kind' must be text or file";
+            error_code = protocol_code::MESSAGE_INVALID;
+            return false;
         }
         if (action == "PULL") {
             if (!require_string_field(data, "conversation_id", error_message)) {
@@ -1691,7 +1750,7 @@ bool websocket_session::handle_login(const json::object& data,
 
     std::string upload_token;
     std::string upload_token_expires_at;
-    if (issue_upload_token(user_id, 2 * 60 * 60, upload_token, upload_token_expires_at)) {
+    if (issue_upload_token(user_id, k_avatar_upload_purpose, 2 * 60 * 60, upload_token, upload_token_expires_at)) {
         response_data["upload_token"] = upload_token;
         response_data["upload_token_expires_at"] = upload_token_expires_at;
         response_data["upload_token_type"] = "Bearer";
@@ -1699,6 +1758,22 @@ bool websocket_session::handle_login(const json::object& data,
         response_data["upload_token"] = "";
         response_data["upload_token_expires_at"] = "";
         response_data["upload_token_type"] = "Bearer";
+    }
+
+    std::string chat_file_upload_token;
+    std::string chat_file_upload_token_expires_at;
+    if (issue_upload_token(user_id,
+                           k_chat_file_token_purpose,
+                           2 * 60 * 60,
+                           chat_file_upload_token,
+                           chat_file_upload_token_expires_at)) {
+        response_data["chat_file_upload_token"] = chat_file_upload_token;
+        response_data["chat_file_upload_token_expires_at"] = chat_file_upload_token_expires_at;
+        response_data["chat_file_upload_token_type"] = "Bearer";
+    } else {
+        response_data["chat_file_upload_token"] = "";
+        response_data["chat_file_upload_token_expires_at"] = "";
+        response_data["chat_file_upload_token_type"] = "Bearer";
     }
 
     bind_authenticated_user(user_id, numeric_id, username, &response_data);
@@ -1730,7 +1805,7 @@ bool websocket_session::handle_logout(const json::object& data,
               << " token_len=" << token.size()
               << " bound_user_id=" << authenticated_user_id_
               << std::endl;
-    if (!validate_upload_token(token, token_user_id, token_error)) {
+    if (!validate_upload_token(token, "", token_user_id, token_error)) {
         response_code = protocol_code::TOKEN_INVALID;
         message = token_error;
         std::cout << "[presence] logout token validation failed session=" << static_cast<const void*>(this)
@@ -3544,16 +3619,61 @@ bool websocket_session::handle_message_send(const json::object& data,
     }
 
     const std::string conversation_id = trim_copy(read_string_or_empty(data, "conversation_id"));
+    const std::string message_kind = trim_copy(read_string_or_empty(data, "message_kind"));
     const std::string content = trim_copy(read_string_or_empty(data, "content"));
+    const bool is_file_message = (message_kind == "file");
+    const bool is_text_message = (!is_file_message && (message_kind.empty() || message_kind == "text"));
     const std::string sent_at = now_utc_iso8601();
-    if (conversation_id.empty() || content.empty()) {
+    chat_file_record attached_file;
+
+    if (conversation_id.empty()) {
         response_code = protocol_code::MESSAGE_INVALID;
-        message = "field 'data.conversation_id' and 'data.content' are required";
+        message = "field 'data.conversation_id' is required";
         return false;
     }
-    if (content.size() > 4096U) {
-        response_code = protocol_code::MESSAGE_TOO_LARGE;
-        message = "field 'data.content' exceeds 4096 characters";
+
+    if (is_text_message) {
+        if (content.empty()) {
+            response_code = protocol_code::MESSAGE_INVALID;
+            message = "field 'data.content' is required for text message";
+            return false;
+        }
+        if (content.size() > 4096U) {
+            response_code = protocol_code::MESSAGE_TOO_LARGE;
+            message = "field 'data.content' exceeds 4096 characters";
+            return false;
+        }
+    } else if (is_file_message) {
+        const json::object* file = read_object_field(data, "file");
+        if (file == nullptr) {
+            response_code = protocol_code::MESSAGE_INVALID;
+            message = "field 'data.file' is required for file message";
+            return false;
+        }
+        const std::string file_id = trim_copy(read_string_or_empty(*file, "file_id"));
+        if (file_id.empty()) {
+            response_code = protocol_code::MESSAGE_INVALID;
+            message = "field 'data.file.file_id' is required";
+            return false;
+        }
+        std::string file_error;
+        std::string file_debug;
+        if (!load_chat_file_for_sender(file_id, authenticated_user_id_, conversation_id, attached_file, file_error, file_debug)) {
+            response_code = protocol_code::MESSAGE_INVALID;
+            message = file_error;
+            response_data["debug"] = json::object{
+                {"chat_file_debug", file_debug}
+            };
+            return false;
+        }
+        if (attached_file.attached) {
+            response_code = protocol_code::MESSAGE_INVALID;
+            message = "chat file already attached to a message";
+            return false;
+        }
+    } else {
+        response_code = protocol_code::MESSAGE_INVALID;
+        message = "field 'data.message_kind' must be text or file";
         return false;
     }
 
@@ -3680,6 +3800,7 @@ bool websocket_session::handle_message_send(const json::object& data,
     }
 
     const std::string message_id = generate_uuid_v4_like();
+    const unsigned long long db_message_type = is_file_message ? k_file_message_type : k_text_message_type;
     std::ostringstream receipt_values;
     std::size_t online_recipients = 0U;
     std::size_t delivered_sessions = 0U;
@@ -3704,6 +3825,38 @@ bool websocket_session::handle_message_send(const json::object& data,
         receipt_values << ")";
     }
 
+    std::string content_sql;
+    json::object event_data;
+    event_data["conversation_id"] = conversation_id;
+    event_data["message_id"] = message_id;
+    event_data["conversation_type"] = conversation_type;
+    event_data["sent_at"] = sent_at;
+    event_data["from_user_id"] = std::to_string(authenticated_user_id_);
+    event_data["from_numeric_id"] = std::to_string(authenticated_numeric_id_);
+    event_data["from_username"] = authenticated_username_;
+    if (is_file_message) {
+        content_sql = "JSON_OBJECT("
+                      "'file_id', '" + sql_escape(attached_file.file_id) + "', "
+                      "'original_name', '" + sql_escape(attached_file.original_name) + "', "
+                      "'stored_name', '" + sql_escape(attached_file.stored_name) + "', "
+                      "'size_bytes', " + std::to_string(static_cast<unsigned long long>(attached_file.size_bytes)) + ", "
+                      "'content_type', '" + sql_escape(attached_file.content_type) + "', "
+                      "'sha256', '" + sql_escape(attached_file.sha256) + "')";
+        json::object file_data;
+        file_data["file_id"] = attached_file.file_id;
+        file_data["original_name"] = attached_file.original_name;
+        file_data["stored_name"] = attached_file.stored_name;
+        file_data["size_bytes"] = static_cast<std::uint64_t>(attached_file.size_bytes);
+        file_data["content_type"] = attached_file.content_type;
+        file_data["sha256"] = attached_file.sha256;
+        event_data["message_kind"] = "file";
+        event_data["file"] = std::move(file_data);
+    } else {
+        content_sql = "JSON_OBJECT('text', '" + sql_escape(content) + "')";
+        event_data["message_kind"] = "text";
+        event_data["content"] = content;
+    }
+
     std::ostringstream send_sql;
     send_sql << "START TRANSACTION; "
              << "SELECT @next_seq := COALESCE(MAX(seq), 0) + 1 "
@@ -3713,8 +3866,8 @@ bool websocket_session::handle_message_send(const json::object& data,
              << internal_conversation_id << ", "
              << authenticated_user_id_ << ", "
              << "@next_seq, "
-             << "1, "
-             << "JSON_OBJECT('text', '" << sql_escape(content) << "'), "
+             << db_message_type << ", "
+             << content_sql << ", "
              << "NULL); "
              << "SET @message_id := LAST_INSERT_ID(); "
              << "UPDATE conversations SET last_message_id=@message_id, updated_at=NOW() WHERE id=" << internal_conversation_id << "; ";
@@ -3757,16 +3910,22 @@ bool websocket_session::handle_message_send(const json::object& data,
         return false;
     }
 
-    json::object event_data;
-    event_data["conversation_id"] = conversation_id;
-    event_data["message_id"] = message_id;
-    event_data["conversation_type"] = conversation_type;
     event_data["seq"] = message_seq;
-    event_data["content"] = content;
-    event_data["sent_at"] = sent_at;
-    event_data["from_user_id"] = std::to_string(authenticated_user_id_);
-    event_data["from_numeric_id"] = std::to_string(authenticated_numeric_id_);
-    event_data["from_username"] = authenticated_username_;
+    if (is_file_message) {
+        std::string bind_error;
+        std::string bind_debug;
+        if (!bind_chat_file_to_message(attached_file.file_id,
+                                       authenticated_user_id_,
+                                       conversation_id,
+                                       message_id,
+                                       bind_error,
+                                       bind_debug)) {
+            response_code = protocol_code::INTERNAL_ERROR;
+            message = bind_error;
+            response_data["debug"].as_object()["chat_file_bind_debug"] = bind_debug;
+            return false;
+        }
+    }
 
     const std::string payload = build_response_payload("MESSAGE",
                                                        "SEND",
@@ -3784,11 +3943,23 @@ bool websocket_session::handle_message_send(const json::object& data,
     response_data["conversation_type"] = conversation_type;
     response_data["message_id"] = message_id;
     response_data["seq"] = message_seq;
-    response_data["content"] = content;
     response_data["sent_at"] = sent_at;
     response_data["recipient_count"] = static_cast<std::uint64_t>(recipient_user_ids.size());
     response_data["online_recipient_count"] = static_cast<std::uint64_t>(online_recipients);
     response_data["delivered_sessions"] = static_cast<std::uint64_t>(delivered_sessions);
+    response_data["message_kind"] = is_file_message ? "file" : "text";
+    if (is_file_message) {
+        json::object file_response;
+        file_response["file_id"] = attached_file.file_id;
+        file_response["original_name"] = attached_file.original_name;
+        file_response["stored_name"] = attached_file.stored_name;
+        file_response["size_bytes"] = static_cast<std::uint64_t>(attached_file.size_bytes);
+        file_response["content_type"] = attached_file.content_type;
+        file_response["sha256"] = attached_file.sha256;
+        response_data["file"] = std::move(file_response);
+    } else {
+        response_data["content"] = content;
+    }
     response_code = protocol_code::OK;
     message = "message sent";
     return true;
