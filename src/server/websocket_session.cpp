@@ -789,16 +789,18 @@ bool parse_profile_row_line(const std::string& row_line,
                             std::string& avatar_url,
                             std::string& nickname,
                             std::string& signature,
-                            std::string& theme)
+                            std::string& theme,
+                            std::string& theme_color)
 {
     const std::vector<std::string> cols = split_by_tab(row_line);
-    if (cols.size() < 4U) {
+    if (cols.size() < 5U) {
         return false;
     }
     avatar_url = (cols[0] == "\\N") ? "" : cols[0];
     nickname = (cols[1] == "\\N") ? "" : cols[1];
     signature = (cols[2] == "\\N") ? "" : cols[2];
     theme = (cols[3] == "\\N") ? "default" : cols[3];
+    theme_color = (cols[4] == "\\N") ? "" : cols[4];
     if (theme.empty()) {
         theme = "default";
     }
@@ -1253,7 +1255,8 @@ bool websocket_session::validate_data_schema(const std::string& type,
                 || !require_string_field(data, "nickname", error_message)
                 || signature_it == data.end()
                 || !signature_it->value().is_string()
-                || !validate_optional_string_max_len(data, "theme", 32, error_message)) {
+                || !validate_optional_string_max_len(data, "theme", 32, error_message)
+                || !validate_optional_string_max_len(data, "theme_color", 32, error_message)) {
                 if (signature_it == data.end() || !signature_it->value().is_string()) {
                     error_message = "field 'data.signature' is required and must be string";
                 }
@@ -1886,7 +1889,8 @@ bool websocket_session::handle_profile_get(const json::object& data,
         << "COALESCE(p.avatar_url, ''), "
         << "COALESCE(p.bio, ''), "
         << "COALESCE(JSON_UNQUOTE(JSON_EXTRACT(p.extra, '$.signature')), ''), "
-        << "COALESCE(JSON_UNQUOTE(JSON_EXTRACT(p.extra, '$.theme')), 'default') "
+        << "COALESCE(JSON_UNQUOTE(JSON_EXTRACT(p.extra, '$.theme')), 'default'), "
+        << "COALESCE(JSON_UNQUOTE(JSON_EXTRACT(p.extra, '$.theme_color')), '') "
         << "FROM user_data u "
         << "LEFT JOIN user_im_profile p ON p.user_id=u.id AND p.deleted_at IS NULL "
         << "WHERE u.numeric_id=" << requested_numeric_id << " "
@@ -1910,7 +1914,7 @@ bool websocket_session::handle_profile_get(const json::object& data,
     }
 
     const std::vector<std::string> cols = split_by_tab(lines.back());
-    if (cols.size() < 12U) {
+    if (cols.size() < 13U) {
         response_code = protocol_code::INTERNAL_ERROR;
         message = "profile get failed: unexpected database output";
         response_data["debug"].as_object()["mysql_output"] = command_output;
@@ -1957,6 +1961,7 @@ bool websocket_session::handle_profile_get(const json::object& data,
     profile["bio"] = (cols[9] == "\\N") ? "" : cols[9];
     profile["signature"] = (cols[10] == "\\N") ? "" : cols[10];
     profile["theme"] = (cols[11] == "\\N") ? "default" : cols[11];
+    profile["theme_color"] = (cols[12] == "\\N") ? "" : cols[12];
     response_data["profile"] = std::move(profile);
     response_code = protocol_code::OK;
     message = "profile get accepted";
@@ -1991,7 +1996,8 @@ bool websocket_session::handle_profile_get_info(const json::object& data,
         << "COALESCE(avatar_url, ''), "
         << "COALESCE(nickname, ''), "
         << "COALESCE(JSON_UNQUOTE(JSON_EXTRACT(extra, '$.signature')), ''), "
-        << "COALESCE(JSON_UNQUOTE(JSON_EXTRACT(extra, '$.theme')), 'default') "
+        << "COALESCE(JSON_UNQUOTE(JSON_EXTRACT(extra, '$.theme')), 'default'), "
+        << "COALESCE(JSON_UNQUOTE(JSON_EXTRACT(extra, '$.theme_color')), '') "
         << "FROM user_im_profile "
         << "WHERE user_id=" << user_id << " AND deleted_at IS NULL "
         << "LIMIT 1;";
@@ -2017,7 +2023,8 @@ bool websocket_session::handle_profile_get_info(const json::object& data,
     std::string nickname;
     std::string signature;
     std::string theme;
-    if (!parse_profile_row_line(lines.back(), avatar_url, nickname, signature, theme)) {
+    std::string theme_color;
+    if (!parse_profile_row_line(lines.back(), avatar_url, nickname, signature, theme, theme_color)) {
         response_code = protocol_code::INTERNAL_ERROR;
         message = "profile get failed: unexpected database output";
         response_data["debug"].as_object()["mysql_output"] = command_output;
@@ -2029,6 +2036,7 @@ bool websocket_session::handle_profile_get_info(const json::object& data,
     profile["nickname"] = nickname;
     profile["signature"] = signature;
     profile["theme"] = theme;
+    profile["theme_color"] = theme_color;
     response_data["profile"] = std::move(profile);
     response_code = protocol_code::OK;
     message = "profile info request accepted";
@@ -2052,6 +2060,7 @@ bool websocket_session::handle_profile_set_info(const json::object& data,
     const std::string nickname = trim_copy(read_string_or_empty(data, "nickname"));
     const std::string signature = trim_copy(read_string_or_empty(data, "signature"));
     const std::string requested_theme = trim_copy(read_string_or_empty(data, "theme"));
+    const std::string theme_color = trim_copy(read_string_or_empty(data, "theme_color"));
     const std::string theme = requested_theme.empty() ? "default" : requested_theme;
 
     const mysql_config cfg = load_mysql_config();
@@ -2071,7 +2080,8 @@ bool websocket_session::handle_profile_set_info(const json::object& data,
         << "avatar_url='" << sql_escape(avatar_url) << "', "
         << "extra=JSON_SET(COALESCE(extra, JSON_OBJECT()), "
         << "'$.signature', '" << sql_escape(signature) << "', "
-        << "'$.theme', '" << sql_escape(theme) << "'), "
+        << "'$.theme', '" << sql_escape(theme) << "', "
+        << "'$.theme_color', '" << sql_escape(theme_color) << "'), "
         << "updated_at=NOW() "
         << "WHERE user_id=" << user_id << " AND deleted_at IS NULL; "
         << "SELECT ROW_COUNT(); "
@@ -2079,7 +2089,8 @@ bool websocket_session::handle_profile_set_info(const json::object& data,
         << "COALESCE(avatar_url, ''), "
         << "COALESCE(nickname, ''), "
         << "COALESCE(JSON_UNQUOTE(JSON_EXTRACT(extra, '$.signature')), ''), "
-        << "COALESCE(JSON_UNQUOTE(JSON_EXTRACT(extra, '$.theme')), 'default') "
+        << "COALESCE(JSON_UNQUOTE(JSON_EXTRACT(extra, '$.theme')), 'default'), "
+        << "COALESCE(JSON_UNQUOTE(JSON_EXTRACT(extra, '$.theme_color')), '') "
         << "FROM user_im_profile "
         << "WHERE user_id=" << user_id << " AND deleted_at IS NULL "
         << "LIMIT 1; "
@@ -2106,7 +2117,13 @@ bool websocket_session::handle_profile_set_info(const json::object& data,
     std::string saved_nickname;
     std::string saved_signature;
     std::string saved_theme;
-    if (!parse_profile_row_line(lines[1], saved_avatar_url, saved_nickname, saved_signature, saved_theme)) {
+    std::string saved_theme_color;
+    if (!parse_profile_row_line(lines[1],
+                                saved_avatar_url,
+                                saved_nickname,
+                                saved_signature,
+                                saved_theme,
+                                saved_theme_color)) {
         response_code = protocol_code::INTERNAL_ERROR;
         message = "profile set failed: unexpected profile row";
         response_data["debug"].as_object()["mysql_output"] = command_output;
@@ -2118,6 +2135,7 @@ bool websocket_session::handle_profile_set_info(const json::object& data,
     profile["nickname"] = saved_nickname;
     profile["signature"] = saved_signature;
     profile["theme"] = saved_theme;
+    profile["theme_color"] = saved_theme_color;
     response_data["profile"] = std::move(profile);
     response_code = protocol_code::OK;
     message = "profile info set accepted";
