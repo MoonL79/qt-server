@@ -175,6 +175,13 @@ private:
                                               bool is_online,
                                               const std::string& last_seen_at,
                                               const char* presence_event);
+    static void broadcast_friend_added_to_user(std::uint64_t recipient_user_id,
+                                               std::uint64_t peer_user_id,
+                                               std::uint64_t peer_numeric_id);
+    static void broadcast_friend_deleted_to_user(std::uint64_t recipient_user_id,
+                                                 std::uint64_t recipient_numeric_id,
+                                                 std::uint64_t peer_user_id,
+                                                 std::uint64_t peer_numeric_id);
     static void broadcast_group_dismissed_to_members(const std::vector<std::uint64_t>& member_user_ids,
                                                      const std::string& conversation_id,
                                                      std::uint64_t group_numeric_id,

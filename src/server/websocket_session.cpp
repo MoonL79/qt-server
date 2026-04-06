@@ -1004,6 +1004,101 @@ bool ensure_private_conversation_uuid(const mysql_config& cfg,
     return true;
 }
 
+bool query_friend_entry_payload(const mysql_config& cfg,
+                                unsigned long long owner_user_id,
+                                unsigned long long friend_user_id,
+                                json::object& item,
+                                std::string& command_output,
+                                int& exit_code)
+{
+    item = {};
+    command_output.clear();
+    exit_code = 0;
+    if (owner_user_id == 0ULL || friend_user_id == 0ULL || owner_user_id == friend_user_id) {
+        command_output = "invalid friend relation";
+        exit_code = -1;
+        return false;
+    }
+
+    std::ostringstream sql;
+    sql << "SELECT "
+        << "u.id, "
+        << "COALESCE(u.numeric_id, 0), "
+        << "u.username, "
+        << "u.status, "
+        << "COALESCE(p.is_online, 0), "
+        << "COALESCE(DATE_FORMAT(p.last_seen_at, '%Y-%m-%dT%H:%i:%sZ'), ''), "
+        << "COALESCE(p.nickname, ''), "
+        << "COALESCE(p.avatar_url, ''), "
+        << "COALESCE(p.bio, '') "
+        << "FROM user_data u "
+        << "LEFT JOIN user_im_profile p ON p.user_id=u.id AND p.deleted_at IS NULL "
+        << "WHERE u.id=" << friend_user_id << " "
+        << "LIMIT 1;";
+    if (!run_mysql_sql(cfg, sql.str(), command_output, exit_code)) {
+        return false;
+    }
+
+    const std::vector<std::string> lines = collect_non_empty_lines(command_output);
+    if (lines.empty()) {
+        command_output = "missing friend profile row";
+        exit_code = -1;
+        return false;
+    }
+
+    const std::vector<std::string> cols = split_by_tab(lines.front());
+    if (cols.size() < 9U) {
+        command_output = "malformed friend profile row";
+        exit_code = -1;
+        return false;
+    }
+
+    unsigned long long parsed_friend_user_id = 0ULL;
+    unsigned long long parsed_friend_numeric_id = 0ULL;
+    unsigned long long user_status = 0ULL;
+    unsigned long long is_online = 0ULL;
+    if (!parse_unsigned_long_long(cols[0], parsed_friend_user_id)
+        || !parse_unsigned_long_long(cols[1], parsed_friend_numeric_id)
+        || !parse_unsigned_long_long(cols[3], user_status)
+        || !parse_unsigned_long_long(cols[4], is_online)) {
+        command_output = "invalid friend profile values";
+        exit_code = -1;
+        return false;
+    }
+
+    unsigned int expected_numeric_id = 0U;
+    if (!build_numeric_user_id(parsed_friend_user_id, expected_numeric_id)
+        || parsed_friend_numeric_id != static_cast<unsigned long long>(expected_numeric_id)) {
+        command_output = "inconsistent user identity in database";
+        exit_code = -1;
+        return false;
+    }
+
+    std::string conversation_uuid;
+    if (!ensure_private_conversation_uuid(cfg,
+                                          owner_user_id,
+                                          parsed_friend_user_id,
+                                          conversation_uuid,
+                                          command_output,
+                                          exit_code)) {
+        return false;
+    }
+
+    item["user_id"] = std::to_string(parsed_friend_user_id);
+    item["numeric_id"] = std::to_string(parsed_friend_numeric_id);
+    item["username"] = (cols[2] == "\\N") ? "" : cols[2];
+    item["status"] = static_cast<int>(user_status);
+    item["user_status"] = static_cast<int>(user_status);
+    item["is_online"] = (is_online != 0ULL);
+    item["last_seen_at"] = (cols[5] == "\\N") ? "" : cols[5];
+    item["nickname"] = (cols[6] == "\\N") ? "" : cols[6];
+    item["avatar_url"] = (cols[7] == "\\N") ? "" : cols[7];
+    item["bio"] = (cols[8] == "\\N") ? "" : cols[8];
+    item["conversation_uuid"] = conversation_uuid;
+    item["conversation_id"] = conversation_uuid;
+    return true;
+}
+
 bool update_user_presence_in_db(const mysql_config& cfg,
                                 unsigned long long user_id,
                                 bool is_online,
@@ -2248,6 +2343,7 @@ bool websocket_session::handle_profile_add_friend(const json::object& data,
     response_data["user_numeric_id"] = std::to_string(user_numeric_id);
     response_data["friend_numeric_id"] = std::to_string(friend_numeric_id);
     response_data["status"] = 1;
+    broadcast_friend_added_to_user(friend_user_id, user_id, user_numeric_id);
     response_code = protocol_code::OK;
     message = "friend added";
     return true;
@@ -3620,6 +3716,9 @@ bool websocket_session::handle_profile_delete_friend(const json::object& data,
     response_data["friend_numeric_id"] = std::to_string(friend_numeric_id);
     response_data["deleted_rows"] = static_cast<std::uint64_t>(deleted_rows);
     response_data["removed"] = (deleted_rows > 0ULL);
+    if (deleted_rows > 0ULL) {
+        broadcast_friend_deleted_to_user(friend_user_id, friend_numeric_id, user_id, user_numeric_id);
+    }
     response_code = protocol_code::OK;
     message = "friend deleted";
     return true;
@@ -4177,6 +4276,110 @@ void websocket_session::broadcast_presence_to_friends(std::uint64_t user_id,
               << " is_online=" << (is_online ? "true" : "false")
               << " friends=" << friend_user_ids.size()
               << " delivered_sessions=" << delivered_sessions
+              << std::endl;
+}
+
+void websocket_session::broadcast_friend_added_to_user(std::uint64_t recipient_user_id,
+                                                       std::uint64_t peer_user_id,
+                                                       std::uint64_t peer_numeric_id)
+{
+    if (recipient_user_id == 0ULL || peer_user_id == 0ULL || peer_numeric_id == 0ULL) {
+        return;
+    }
+
+    const mysql_config cfg = load_mysql_config();
+    std::string config_error;
+    if (!is_mysql_config_valid(cfg, config_error)) {
+        std::cerr << "[friend] skip add broadcast recipient_user_id=" << recipient_user_id
+                  << " peer_user_id=" << peer_user_id
+                  << " reason=" << config_error
+                  << std::endl;
+        return;
+    }
+
+    json::object friend_item;
+    std::string command_output;
+    int exit_code = 0;
+    if (!query_friend_entry_payload(cfg,
+                                    recipient_user_id,
+                                    peer_user_id,
+                                    friend_item,
+                                    command_output,
+                                    exit_code)) {
+        std::cerr << "[friend] skip add broadcast recipient_user_id=" << recipient_user_id
+                  << " peer_user_id=" << peer_user_id
+                  << " exit_code=" << exit_code
+                  << " output=" << command_output
+                  << std::endl;
+        return;
+    }
+
+    json::object data;
+    data["friend_event"] = "added";
+    data["refresh_hint"] = "reload_friends";
+    data["friend"] = friend_item;
+    data["user_id"] = std::to_string(recipient_user_id);
+    data["friend_user_id"] = std::to_string(peer_user_id);
+    data["friend_numeric_id"] = std::to_string(peer_numeric_id);
+
+    const std::string payload = build_response_payload("PROFILE",
+                                                       "ADD_FRIEND",
+                                                       generate_uuid_v4_like(),
+                                                       protocol_code::OK,
+                                                       true,
+                                                       "friend added event",
+                                                       std::move(data));
+
+    const std::vector<std::shared_ptr<websocket_session>> sessions =
+        snapshot_authenticated_sessions(recipient_user_id);
+    for (const std::shared_ptr<websocket_session>& session : sessions) {
+        session->queue_outbound_message(payload);
+    }
+
+    std::cout << "[friend] broadcast added"
+              << " recipient_user_id=" << recipient_user_id
+              << " peer_user_id=" << peer_user_id
+              << " delivered_sessions=" << sessions.size()
+              << std::endl;
+}
+
+void websocket_session::broadcast_friend_deleted_to_user(std::uint64_t recipient_user_id,
+                                                         std::uint64_t recipient_numeric_id,
+                                                         std::uint64_t peer_user_id,
+                                                         std::uint64_t peer_numeric_id)
+{
+    if (recipient_user_id == 0ULL || recipient_numeric_id == 0ULL
+        || peer_user_id == 0ULL || peer_numeric_id == 0ULL) {
+        return;
+    }
+
+    json::object data;
+    data["friend_event"] = "deleted";
+    data["refresh_hint"] = "reload_friends";
+    data["user_id"] = std::to_string(recipient_user_id);
+    data["user_numeric_id"] = std::to_string(recipient_numeric_id);
+    data["friend_user_id"] = std::to_string(peer_user_id);
+    data["friend_numeric_id"] = std::to_string(peer_numeric_id);
+    data["removed"] = true;
+
+    const std::string payload = build_response_payload("PROFILE",
+                                                       "DELETE_FRIEND",
+                                                       generate_uuid_v4_like(),
+                                                       protocol_code::OK,
+                                                       true,
+                                                       "friend deleted event",
+                                                       std::move(data));
+
+    const std::vector<std::shared_ptr<websocket_session>> sessions =
+        snapshot_authenticated_sessions(recipient_user_id);
+    for (const std::shared_ptr<websocket_session>& session : sessions) {
+        session->queue_outbound_message(payload);
+    }
+
+    std::cout << "[friend] broadcast deleted"
+              << " recipient_user_id=" << recipient_user_id
+              << " peer_user_id=" << peer_user_id
+              << " delivered_sessions=" << sessions.size()
               << std::endl;
 }
 
