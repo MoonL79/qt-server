@@ -100,7 +100,9 @@ int main(int argc, char* argv[])
     set_env_if_absent("QT_SERVER_STATIC_ROOT", default_static_root.c_str());
     set_env_if_absent("QT_SERVER_STATIC_PUBLIC_HOST", "127.0.0.1");
     set_env_if_absent("QT_SERVER_STATIC_PUBLIC_SCHEME", "http");
-    set_env_if_absent("QT_SERVER_DEV_ADMIN_TOKEN", "dev-admin-123456");
+    set_env_if_absent("QT_SERVER_ADMIN_BOOTSTRAP_USERNAME", "admin");
+    set_env_if_absent("QT_SERVER_ADMIN_BOOTSTRAP_PASSWORD", "Admin123456");
+    set_env_if_absent("QT_SERVER_ADMIN_BOOTSTRAP_DISPLAY_NAME", "系统管理员");
 
     // 设置信号处理
     std::signal(SIGINT, signal_handler);

@@ -6,6 +6,7 @@
 namespace qt_server {
 namespace server {
 
+std::string build_dev_admin_login_page();
 std::string build_dev_user_admin_page();
 
 } // namespace server

@@ -10,8 +10,10 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <mutex>
 #include <random>
 #include <sstream>
+#include <unordered_map>
 #include <vector>
 
 #if !defined(_WIN32)
@@ -20,6 +22,10 @@
 
 namespace qt_server {
 namespace server {
+
+std::string default_bootstrap_admin_username();
+std::string default_bootstrap_admin_password();
+int admin_session_ttl_seconds();
 
 namespace {
 
@@ -31,6 +37,15 @@ struct mysql_config
     std::string user;
     std::string password;
 };
+
+struct admin_session_entry
+{
+    unsigned long long admin_user_id = 0ULL;
+    std::chrono::system_clock::time_point expires_at;
+};
+
+std::mutex g_admin_sessions_mutex;
+std::unordered_map<std::string, admin_session_entry> g_admin_sessions;
 
 std::string trim_copy(const std::string& input)
 {
@@ -578,6 +593,49 @@ std::string hash_password_for_storage(const std::string& plain_password)
     return oss.str();
 }
 
+bool verify_password_against_storage(const std::string& plain_password,
+                                     const std::string& stored_hash)
+{
+    const std::string prefix = "pbkdf2_sha256$";
+    if (stored_hash.rfind(prefix, 0U) != 0U) {
+        return false;
+    }
+
+    const std::string body = stored_hash.substr(prefix.size());
+    const std::size_t p1 = body.find('$');
+    const std::size_t p2 = (p1 == std::string::npos) ? std::string::npos : body.find('$', p1 + 1U);
+    if (p1 == std::string::npos || p2 == std::string::npos) {
+        return false;
+    }
+
+    const std::string iterations_text = body.substr(0U, p1);
+    const std::string salt_hex = body.substr(p1 + 1U, p2 - (p1 + 1U));
+    const std::string digest_hex = body.substr(p2 + 1U);
+    if (iterations_text.empty() || salt_hex.empty() || digest_hex.empty()) {
+        return false;
+    }
+
+    int iterations = 0;
+    std::istringstream iter_stream(iterations_text);
+    iter_stream >> iterations;
+    if (iter_stream.fail() || iterations <= 0) {
+        return false;
+    }
+
+    std::vector<unsigned char> salt;
+    std::vector<unsigned char> stored_digest;
+    if (!hex_to_bytes(salt_hex, salt) || !hex_to_bytes(digest_hex, stored_digest) || stored_digest.empty()) {
+        return false;
+    }
+
+    const std::vector<unsigned char> password_bytes(plain_password.begin(), plain_password.end());
+    const std::vector<unsigned char> computed = pbkdf2_hmac_sha256(password_bytes,
+                                                                   salt,
+                                                                   iterations,
+                                                                   stored_digest.size());
+    return constant_time_equal(stored_digest, computed);
+}
+
 std::string generate_uuid_v4_like()
 {
     static std::random_device rd;
@@ -609,6 +667,212 @@ void set_error(user_admin_error& error,
     error.code = code;
     error.message = message;
     error.debug = debug;
+}
+
+std::string default_bootstrap_admin_display_name()
+{
+    return "系统管理员";
+}
+
+std::string read_env_string_or_default(const char* key, const std::string& fallback)
+{
+    const char* value = std::getenv(key);
+    if (value == nullptr || *value == '\0') {
+        return fallback;
+    }
+    return value;
+}
+
+std::string make_admin_session_token()
+{
+    return bytes_to_hex(secure_random_bytes(24U));
+}
+
+void prune_expired_admin_sessions_locked()
+{
+    const auto now = std::chrono::system_clock::now();
+    for (auto it = g_admin_sessions.begin(); it != g_admin_sessions.end(); ) {
+        if (it->second.expires_at <= now) {
+            it = g_admin_sessions.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+std::string build_admin_select_sql()
+{
+    std::ostringstream sql;
+    sql << "SELECT "
+        << "id, "
+        << "username, "
+        << "display_name, "
+        << "password_hash, "
+        << "status, "
+        << "COALESCE(DATE_FORMAT(last_login_at, '%Y-%m-%d %H:%i:%s'), ''), "
+        << "COALESCE(DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s'), ''), "
+        << "COALESCE(DATE_FORMAT(updated_at, '%Y-%m-%d %H:%i:%s'), '') "
+        << "FROM admin_users ";
+    return sql.str();
+}
+
+bool parse_admin_user_cols(const std::vector<std::string>& cols,
+                           admin_user_account& admin,
+                           std::string* password_hash = nullptr)
+{
+    if (cols.size() < 8U) {
+        return false;
+    }
+
+    unsigned long long admin_user_id = 0ULL;
+    unsigned long long status = 0ULL;
+    if (!parse_unsigned_long_long(cols[0], admin_user_id)
+        || !parse_unsigned_long_long(cols[4], status)) {
+        return false;
+    }
+
+    admin.admin_user_id = admin_user_id;
+    admin.username = (cols[1] == "\\N") ? "" : cols[1];
+    admin.display_name = (cols[2] == "\\N") ? "" : cols[2];
+    admin.status = static_cast<unsigned int>(status);
+    admin.last_login_at = (cols[5] == "\\N") ? "" : cols[5];
+    admin.created_at = (cols[6] == "\\N") ? "" : cols[6];
+    admin.updated_at = (cols[7] == "\\N") ? "" : cols[7];
+    if (password_hash != nullptr) {
+        *password_hash = (cols[3] == "\\N") ? "" : cols[3];
+    }
+    return true;
+}
+
+bool ensure_admin_users_bootstrap(const mysql_config& cfg,
+                                  user_admin_error& error)
+{
+    const std::string bootstrap_username = trim_copy(read_env_string_or_default("QT_SERVER_ADMIN_BOOTSTRAP_USERNAME",
+                                                                                 default_bootstrap_admin_username()));
+    const std::string bootstrap_password = read_env_string_or_default("QT_SERVER_ADMIN_BOOTSTRAP_PASSWORD",
+                                                                      default_bootstrap_admin_password());
+    const std::string bootstrap_display_name = trim_copy(read_env_string_or_default("QT_SERVER_ADMIN_BOOTSTRAP_DISPLAY_NAME",
+                                                                                     default_bootstrap_admin_display_name()));
+
+    if (!is_valid_username(bootstrap_username)) {
+        set_error(error,
+                  user_admin_error_code::config,
+                  "invalid bootstrap admin username",
+                  "QT_SERVER_ADMIN_BOOTSTRAP_USERNAME must match [A-Za-z0-9_], length 3~32");
+        return false;
+    }
+    if (!is_strong_password(bootstrap_password)) {
+        set_error(error,
+                  user_admin_error_code::config,
+                  "invalid bootstrap admin password",
+                  "QT_SERVER_ADMIN_BOOTSTRAP_PASSWORD must be 8~64 and include upper/lower letters and digits");
+        return false;
+    }
+    if (bootstrap_display_name.empty() || bootstrap_display_name.size() > 64U) {
+        set_error(error,
+                  user_admin_error_code::config,
+                  "invalid bootstrap admin display_name",
+                  "QT_SERVER_ADMIN_BOOTSTRAP_DISPLAY_NAME length must be 1~64");
+        return false;
+    }
+
+    const std::string bootstrap_hash = hash_password_for_storage(bootstrap_password);
+    std::ostringstream sql;
+    sql << "CREATE TABLE IF NOT EXISTS admin_users ("
+        << "id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,"
+        << "username VARCHAR(64) NOT NULL,"
+        << "display_name VARCHAR(64) NOT NULL,"
+        << "password_hash VARCHAR(255) NOT NULL,"
+        << "status TINYINT UNSIGNED NOT NULL DEFAULT 1,"
+        << "last_login_at DATETIME NULL,"
+        << "created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        << "updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,"
+        << "PRIMARY KEY (id),"
+        << "UNIQUE KEY uk_admin_users_username (username),"
+        << "KEY idx_admin_users_status (status)"
+        << ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci; "
+        << "INSERT INTO admin_users (username, display_name, password_hash, status, created_at, updated_at) "
+        << "SELECT '"
+        << sql_escape(bootstrap_username) << "', '"
+        << sql_escape(bootstrap_display_name) << "', '"
+        << sql_escape(bootstrap_hash) << "', 1, NOW(), NOW() "
+        << "FROM DUAL WHERE NOT EXISTS (SELECT 1 FROM admin_users LIMIT 1);";
+
+    std::string command_output;
+    int exit_code = 0;
+    if (!run_mysql_sql(cfg, sql.str(), command_output, exit_code)) {
+        std::ostringstream debug;
+        debug << "exit_code=" << exit_code << "; output=" << trim_copy(command_output);
+        set_error(error, user_admin_error_code::database, "failed to prepare admin_users", debug.str());
+        return false;
+    }
+    return true;
+}
+
+bool load_admin_user_by_id(const mysql_config& cfg,
+                           unsigned long long admin_user_id,
+                           admin_user_account& admin,
+                           std::string* password_hash,
+                           user_admin_error& error)
+{
+    std::ostringstream sql;
+    sql << build_admin_select_sql()
+        << "WHERE id=" << admin_user_id << " "
+        << "LIMIT 1;";
+
+    std::string command_output;
+    int exit_code = 0;
+    if (!run_mysql_sql(cfg, sql.str(), command_output, exit_code)) {
+        std::ostringstream debug;
+        debug << "exit_code=" << exit_code << "; output=" << trim_copy(command_output);
+        set_error(error, user_admin_error_code::database, "failed to query admin user", debug.str());
+        return false;
+    }
+
+    const std::vector<std::string> lines = collect_non_empty_lines(command_output);
+    if (lines.empty()) {
+        set_error(error, user_admin_error_code::not_found, "admin user not found");
+        return false;
+    }
+
+    if (!parse_admin_user_cols(split_by_tab(lines.back()), admin, password_hash)) {
+        set_error(error, user_admin_error_code::database, "failed to parse admin user row", trim_copy(command_output));
+        return false;
+    }
+    return true;
+}
+
+bool load_admin_user_by_username(const mysql_config& cfg,
+                                 const std::string& username,
+                                 admin_user_account& admin,
+                                 std::string& password_hash,
+                                 user_admin_error& error)
+{
+    std::ostringstream sql;
+    sql << build_admin_select_sql()
+        << "WHERE username='" << sql_escape(username) << "' "
+        << "LIMIT 1;";
+
+    std::string command_output;
+    int exit_code = 0;
+    if (!run_mysql_sql(cfg, sql.str(), command_output, exit_code)) {
+        std::ostringstream debug;
+        debug << "exit_code=" << exit_code << "; output=" << trim_copy(command_output);
+        set_error(error, user_admin_error_code::database, "failed to query admin user", debug.str());
+        return false;
+    }
+
+    const std::vector<std::string> lines = collect_non_empty_lines(command_output);
+    if (lines.empty()) {
+        set_error(error, user_admin_error_code::unauthorized, "invalid admin username or password");
+        return false;
+    }
+
+    if (!parse_admin_user_cols(split_by_tab(lines.back()), admin, &password_hash)) {
+        set_error(error, user_admin_error_code::database, "failed to parse admin user row", trim_copy(command_output));
+        return false;
+    }
+    return true;
 }
 
 bool parse_managed_user_cols(const std::vector<std::string>& cols,
@@ -1023,17 +1287,149 @@ bool reset_managed_user_password(unsigned long long user_id,
     return true;
 }
 
-std::string default_dev_admin_token()
+bool login_admin_user(const std::string& username,
+                      const std::string& password,
+                      admin_login_result& result,
+                      user_admin_error& error)
 {
-    return "dev-admin-123456";
+    result = admin_login_result{};
+    error = user_admin_error{};
+
+    const std::string trimmed_username = trim_copy(username);
+    if (!is_valid_username(trimmed_username)) {
+        set_error(error, user_admin_error_code::validation, "admin username format is invalid");
+        return false;
+    }
+    if (password.empty()) {
+        set_error(error, user_admin_error_code::validation, "admin password is required");
+        return false;
+    }
+
+    const mysql_config cfg = load_mysql_config();
+    std::string config_error;
+    if (!is_mysql_config_valid(cfg, config_error)) {
+        set_error(error, user_admin_error_code::config, "database config missing", config_error);
+        return false;
+    }
+    if (!ensure_admin_users_bootstrap(cfg, error)) {
+        return false;
+    }
+
+    admin_user_account admin;
+    std::string password_hash;
+    if (!load_admin_user_by_username(cfg, trimmed_username, admin, password_hash, error)) {
+        return false;
+    }
+    if (!verify_password_against_storage(password, password_hash)) {
+        set_error(error, user_admin_error_code::unauthorized, "invalid admin username or password");
+        return false;
+    }
+    if (admin.status == 0U) {
+        set_error(error, user_admin_error_code::unauthorized, "admin account is disabled");
+        return false;
+    }
+
+    std::ostringstream update_sql;
+    update_sql << "UPDATE admin_users SET last_login_at=NOW(), updated_at=NOW() "
+               << "WHERE id=" << admin.admin_user_id << ";";
+    std::string update_output;
+    int update_exit_code = 0;
+    if (!run_mysql_sql(cfg, update_sql.str(), update_output, update_exit_code)) {
+        std::ostringstream debug;
+        debug << "exit_code=" << update_exit_code << "; output=" << trim_copy(update_output);
+        set_error(error, user_admin_error_code::database, "failed to update admin login time", debug.str());
+        return false;
+    }
+
+    if (!load_admin_user_by_id(cfg, admin.admin_user_id, admin, nullptr, error)) {
+        return false;
+    }
+
+    result.admin = admin;
+    result.session_token = make_admin_session_token();
+    result.session_ttl_seconds = admin_session_ttl_seconds();
+    {
+        std::lock_guard<std::mutex> lock(g_admin_sessions_mutex);
+        prune_expired_admin_sessions_locked();
+        g_admin_sessions[result.session_token] = admin_session_entry{
+            admin.admin_user_id,
+            std::chrono::system_clock::now() + std::chrono::seconds(result.session_ttl_seconds)
+        };
+    }
+    return true;
 }
 
-bool is_dev_admin_token_valid(const std::string& token)
+bool validate_admin_session(const std::string& session_token,
+                            admin_user_account& admin,
+                            user_admin_error& error)
 {
-    const std::string fallback = default_dev_admin_token();
-    const std::string expected = getenv_or_default("QT_SERVER_DEV_ADMIN_TOKEN",
-                                                   fallback.c_str());
-    return !token.empty() && token == expected;
+    admin = admin_user_account{};
+    error = user_admin_error{};
+    if (session_token.empty()) {
+        set_error(error, user_admin_error_code::unauthorized, "missing admin session");
+        return false;
+    }
+
+    unsigned long long admin_user_id = 0ULL;
+    {
+        std::lock_guard<std::mutex> lock(g_admin_sessions_mutex);
+        prune_expired_admin_sessions_locked();
+        const auto it = g_admin_sessions.find(session_token);
+        if (it == g_admin_sessions.end()) {
+            set_error(error, user_admin_error_code::unauthorized, "admin session is invalid or expired");
+            return false;
+        }
+        admin_user_id = it->second.admin_user_id;
+        it->second.expires_at = std::chrono::system_clock::now() + std::chrono::seconds(admin_session_ttl_seconds());
+    }
+
+    const mysql_config cfg = load_mysql_config();
+    std::string config_error;
+    if (!is_mysql_config_valid(cfg, config_error)) {
+        set_error(error, user_admin_error_code::config, "database config missing", config_error);
+        return false;
+    }
+    if (!ensure_admin_users_bootstrap(cfg, error)) {
+        return false;
+    }
+    if (!load_admin_user_by_id(cfg, admin_user_id, admin, nullptr, error)) {
+        return false;
+    }
+    if (admin.status == 0U) {
+        logout_admin_session(session_token);
+        set_error(error, user_admin_error_code::unauthorized, "admin account is disabled");
+        return false;
+    }
+    return true;
+}
+
+void logout_admin_session(const std::string& session_token)
+{
+    if (session_token.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_admin_sessions_mutex);
+    g_admin_sessions.erase(session_token);
+}
+
+std::string admin_session_cookie_name()
+{
+    return "qt_server_admin_session";
+}
+
+int admin_session_ttl_seconds()
+{
+    return 12 * 60 * 60;
+}
+
+std::string default_bootstrap_admin_username()
+{
+    return "admin";
+}
+
+std::string default_bootstrap_admin_password()
+{
+    return "Admin123456";
 }
 
 } // namespace server

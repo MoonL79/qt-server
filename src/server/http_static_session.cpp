@@ -451,6 +451,65 @@ bool try_get_header_value(const http::request<http::string_body>& request,
     return false;
 }
 
+std::map<std::string, std::string> parse_cookie_header(const std::string& raw_cookie)
+{
+    std::map<std::string, std::string> cookies;
+    std::size_t begin = 0U;
+    while (begin < raw_cookie.size()) {
+        const std::size_t semi = raw_cookie.find(';', begin);
+        const std::string pair = raw_cookie.substr(begin, semi == std::string::npos ? std::string::npos : (semi - begin));
+        const std::size_t equal = pair.find('=');
+        if (equal != std::string::npos) {
+            const std::string key = trim_ascii_copy(pair.substr(0U, equal));
+            const std::string value = trim_ascii_copy(pair.substr(equal + 1U));
+            if (!key.empty()) {
+                cookies[key] = value;
+            }
+        }
+        if (semi == std::string::npos) {
+            break;
+        }
+        begin = semi + 1U;
+    }
+    return cookies;
+}
+
+bool read_cookie_value(const http::request<http::string_body>& request,
+                       const std::string& cookie_name,
+                       std::string& value)
+{
+    std::string raw_cookie;
+    if (!try_get_header_value(request, "Cookie", raw_cookie)) {
+        value.clear();
+        return false;
+    }
+    const std::map<std::string, std::string> cookies = parse_cookie_header(raw_cookie);
+    const auto it = cookies.find(cookie_name);
+    if (it == cookies.end()) {
+        value.clear();
+        return false;
+    }
+    value = it->second;
+    return !value.empty();
+}
+
+std::string build_admin_session_set_cookie(const std::string& session_token)
+{
+    std::ostringstream oss;
+    oss << admin_session_cookie_name()
+        << "=" << session_token
+        << "; Path=/admin; HttpOnly; SameSite=Lax; Max-Age=" << admin_session_ttl_seconds();
+    return oss.str();
+}
+
+std::string build_admin_session_clear_cookie()
+{
+    std::ostringstream oss;
+    oss << admin_session_cookie_name()
+        << "=; Path=/admin; HttpOnly; SameSite=Lax; Max-Age=0";
+    return oss.str();
+}
+
 std::string read_json_string(const json::object& obj, const char* field)
 {
     const auto it = obj.find(field);
@@ -602,6 +661,19 @@ json::object managed_user_to_json(const managed_user_record& user)
     return item;
 }
 
+json::object admin_user_to_json(const admin_user_account& admin)
+{
+    json::object item;
+    item["admin_user_id"] = std::to_string(admin.admin_user_id);
+    item["username"] = admin.username;
+    item["display_name"] = admin.display_name;
+    item["status"] = static_cast<int>(admin.status);
+    item["last_login_at"] = admin.last_login_at;
+    item["created_at"] = admin.created_at;
+    item["updated_at"] = admin.updated_at;
+    return item;
+}
+
 } // namespace
 
 http_static_session::http_static_session(tcp::socket socket,
@@ -670,6 +742,23 @@ void http_static_session::send_json_payload(http::status status, const std::stri
     send_string_payload(status, "application/json; charset=utf-8", "no-store", body);
 }
 
+void http_static_session::send_redirect_response(const std::string& location,
+                                                 const std::string& set_cookie)
+{
+    http::response<http::string_body> response{http::status::found, request_.version()};
+    response.set(http::field::server, BOOST_BEAST_VERSION_STRING);
+    response.set(http::field::location, location);
+    response.set(http::field::cache_control, "no-store");
+    response.set("X-Content-Type-Options", "nosniff");
+    if (!set_cookie.empty()) {
+        response.set(http::field::set_cookie, set_cookie);
+    }
+    response.keep_alive(false);
+    response.body() = "redirect";
+    response.prepare_payload();
+    send_response(std::move(response));
+}
+
 void http_static_session::send_json_response(http::status status,
                                              bool ok,
                                              const std::string& message,
@@ -686,6 +775,31 @@ void http_static_session::send_json_response(http::status status,
     send_json_payload(status, oss.str());
 }
 
+void http_static_session::handle_dev_admin_login_page()
+{
+    if (request_.method() != http::verb::get) {
+        json::object response;
+        response["ok"] = false;
+        response["message"] = "method not allowed";
+        send_json_payload(http::status::method_not_allowed, json::serialize(response));
+        return;
+    }
+
+    std::string session_token;
+    admin_user_account admin;
+    user_admin_error error;
+    if (read_cookie_value(request_, admin_session_cookie_name(), session_token)
+        && validate_admin_session(session_token, admin, error)) {
+        send_redirect_response("/admin/users");
+        return;
+    }
+
+    send_string_payload(http::status::ok,
+                        "text/html; charset=utf-8",
+                        "no-store",
+                        build_dev_admin_login_page());
+}
+
 void http_static_session::handle_dev_admin_page()
 {
     if (request_.method() != http::verb::get) {
@@ -695,10 +809,139 @@ void http_static_session::handle_dev_admin_page()
         send_json_payload(http::status::method_not_allowed, json::serialize(response));
         return;
     }
+
+    std::string session_token;
+    admin_user_account admin;
+    user_admin_error error;
+    if (!read_cookie_value(request_, admin_session_cookie_name(), session_token)
+        || !validate_admin_session(session_token, admin, error)) {
+        send_redirect_response("/admin/login",
+                               session_token.empty() ? std::string() : build_admin_session_clear_cookie());
+        return;
+    }
+
     send_string_payload(http::status::ok,
                         "text/html; charset=utf-8",
                         "no-store",
                         build_dev_user_admin_page());
+}
+
+void http_static_session::handle_dev_admin_session_api(const std::string& clean_target)
+{
+    const auto send_api_json = [this](http::status status,
+                                      const json::object& payload,
+                                      const std::string& set_cookie = std::string()) {
+        http::response<http::string_body> response{status, request_.version()};
+        response.set(http::field::server, BOOST_BEAST_VERSION_STRING);
+        response.set(http::field::content_type, "application/json; charset=utf-8");
+        response.set(http::field::cache_control, "no-store");
+        response.set("X-Content-Type-Options", "nosniff");
+        if (!set_cookie.empty()) {
+            response.set(http::field::set_cookie, set_cookie);
+        }
+        response.keep_alive(false);
+        response.body() = json::serialize(payload);
+        response.prepare_payload();
+        send_response(std::move(response));
+    };
+
+    const auto send_api_error = [&send_api_json](http::status status,
+                                                 const std::string& message,
+                                                 const std::string& debug = std::string(),
+                                                 const std::string& set_cookie = std::string()) {
+        json::object response;
+        response["ok"] = false;
+        response["message"] = message;
+        if (!debug.empty()) {
+            response["debug"] = debug;
+        }
+        send_api_json(status, response, set_cookie);
+    };
+
+    if (clean_target == "/admin/api/session/login") {
+        if (request_.method() != http::verb::post) {
+            send_api_error(http::status::method_not_allowed, "method not allowed");
+            return;
+        }
+
+        json::object body;
+        std::string parse_error;
+        if (!read_json_object_body(request_, body, parse_error)) {
+            send_api_error(http::status::bad_request, parse_error);
+            return;
+        }
+
+        std::string username;
+        std::string password;
+        if (!read_required_json_string(body, "username", username, parse_error)
+            || !read_required_json_string(body, "password", password, parse_error)) {
+            send_api_error(http::status::bad_request, parse_error);
+            return;
+        }
+
+        admin_login_result result;
+        user_admin_error error;
+        if (!login_admin_user(username, password, result, error)) {
+            send_api_error(to_http_status(error.code), error.message, error.debug);
+            return;
+        }
+
+        json::object response;
+        response["ok"] = true;
+        response["message"] = "admin login accepted";
+        response["redirect_to"] = "/admin/users";
+        response["session_ttl_seconds"] = result.session_ttl_seconds;
+        response["admin"] = admin_user_to_json(result.admin);
+        send_api_json(http::status::ok,
+                      response,
+                      build_admin_session_set_cookie(result.session_token));
+        return;
+    }
+
+    if (clean_target == "/admin/api/session/logout") {
+        if (request_.method() != http::verb::post) {
+            send_api_error(http::status::method_not_allowed, "method not allowed");
+            return;
+        }
+
+        std::string session_token;
+        read_cookie_value(request_, admin_session_cookie_name(), session_token);
+        logout_admin_session(session_token);
+
+        json::object response;
+        response["ok"] = true;
+        response["message"] = "admin logout accepted";
+        send_api_json(http::status::ok, response, build_admin_session_clear_cookie());
+        return;
+    }
+
+    if (clean_target == "/admin/api/session/me") {
+        if (request_.method() != http::verb::get) {
+            send_api_error(http::status::method_not_allowed, "method not allowed");
+            return;
+        }
+
+        std::string session_token;
+        admin_user_account admin;
+        user_admin_error error;
+        if (!read_cookie_value(request_, admin_session_cookie_name(), session_token)
+            || !validate_admin_session(session_token, admin, error)) {
+            send_api_error(http::status::unauthorized,
+                           error.message.empty() ? "missing admin session" : error.message,
+                           error.debug,
+                           build_admin_session_clear_cookie());
+            return;
+        }
+
+        json::object response;
+        response["ok"] = true;
+        response["message"] = "admin session is valid";
+        response["admin"] = admin_user_to_json(admin);
+        send_api_json(http::status::ok, response);
+        return;
+    }
+
+    send_api_error(http::status::not_found, "resource not found");
 }
 
 void http_static_session::handle_dev_admin_api(const std::string& clean_target)
@@ -722,14 +965,14 @@ void http_static_session::handle_dev_admin_api(const std::string& clean_target)
         send_json_payload(http::status::method_not_allowed, json::serialize(response));
     };
 
-    std::string raw_admin_token;
-    if (!try_get_header_value(request_, "X-Dev-Admin-Token", raw_admin_token)) {
-        send_api_error(http::status::unauthorized, "missing or invalid developer admin token");
-        return;
-    }
-    const std::string admin_token = trim_copy(raw_admin_token);
-    if (!is_dev_admin_token_valid(admin_token)) {
-        send_api_error(http::status::unauthorized, "missing or invalid developer admin token");
+    std::string session_token;
+    admin_user_account admin;
+    user_admin_error admin_error;
+    if (!read_cookie_value(request_, admin_session_cookie_name(), session_token)
+        || !validate_admin_session(session_token, admin, admin_error)) {
+        send_api_error(http::status::unauthorized,
+                       admin_error.message.empty() ? "missing admin session" : admin_error.message,
+                       admin_error.debug);
         return;
     }
 
@@ -923,8 +1166,20 @@ void http_static_session::handle_request()
     const std::string request_target = std::string(request_.target());
     const std::size_t query_pos = request_target.find('?');
     const std::string clean_target = request_target.substr(0U, query_pos);
+    if (clean_target == "/admin" || clean_target == "/admin/") {
+        send_redirect_response("/admin/users");
+        return;
+    }
+    if (clean_target == "/admin/login") {
+        handle_dev_admin_login_page();
+        return;
+    }
     if (clean_target == "/admin/users") {
         handle_dev_admin_page();
+        return;
+    }
+    if (clean_target.rfind("/admin/api/session", 0U) == 0U) {
+        handle_dev_admin_session_api(clean_target);
         return;
     }
     if (clean_target.rfind("/admin/api/users", 0U) == 0U) {

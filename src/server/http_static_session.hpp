@@ -45,7 +45,9 @@ private:
 
     void do_read();
     void on_read(beast::error_code ec, std::size_t bytes_transferred);
+    void handle_dev_admin_login_page();
     void handle_dev_admin_page();
+    void handle_dev_admin_session_api(const std::string& clean_target);
     void handle_dev_admin_api(const std::string& clean_target);
 
     template <class Body, class Fields>
@@ -65,6 +67,8 @@ private:
                              const std::string& content_type,
                              const std::string& cache_control,
                              const std::string& body);
+    void send_redirect_response(const std::string& location,
+                                const std::string& set_cookie = "");
     void handle_request();
     void handle_upload_avatar();
     void handle_upload_chat_file();

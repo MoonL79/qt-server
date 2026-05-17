@@ -24,40 +24,268 @@ std::string replace_all(std::string text,
     return text;
 }
 
-std::string js_escape(const std::string& input)
-{
-    std::string out;
-    out.reserve(input.size() + 8U);
-    for (char ch : input) {
-        switch (ch) {
-        case '\\':
-            out += "\\\\";
-            break;
-        case '"':
-            out += "\\\"";
-            break;
-        case '\r':
-            out += "\\r";
-            break;
-        case '\n':
-            out += "\\n";
-            break;
-        case '\t':
-            out += "\\t";
-            break;
-        default:
-            out += ch;
-            break;
-        }
-    }
-    return out;
-}
-
 } // namespace
+
+std::string build_dev_admin_login_page()
+{
+    std::string page = R"PAGE(<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>管理员登录</title>
+  <style>
+    :root {
+      --bg: #f3eee6;
+      --text: #2f241d;
+      --muted: #6d5b4f;
+      --line: rgba(94, 76, 60, 0.14);
+      --panel: rgba(255, 252, 246, 0.94);
+      --primary: #b3532f;
+      --secondary: #1f6c63;
+      --danger: #a33f32;
+      --shadow: 0 18px 40px rgba(90, 67, 48, 0.14);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background:
+        radial-gradient(circle at top left, rgba(179, 83, 47, 0.16), transparent 30%),
+        radial-gradient(circle at 85% 10%, rgba(31, 108, 99, 0.15), transparent 24%),
+        linear-gradient(180deg, var(--bg) 0%, #fbf7f2 100%);
+      color: var(--text);
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      padding: 18px;
+    }
+
+    .shell {
+      width: min(960px, 100%);
+      display: grid;
+      grid-template-columns: minmax(0, 1.15fr) minmax(320px, 0.85fr);
+      gap: 18px;
+      align-items: stretch;
+    }
+
+    .hero,
+    .card {
+      background: var(--panel);
+      border: 1px solid rgba(255, 255, 255, 0.56);
+      border-radius: 28px;
+      box-shadow: var(--shadow);
+    }
+
+    .hero {
+      padding: 30px;
+      display: grid;
+      gap: 16px;
+    }
+
+    .hero h1 {
+      margin: 0;
+      font-size: clamp(30px, 4vw, 44px);
+      line-height: 1.04;
+      letter-spacing: -0.04em;
+    }
+
+    .hero p,
+    .hero li {
+      color: var(--muted);
+      line-height: 1.75;
+      font-size: 14px;
+    }
+
+    .hero ul {
+      margin: 0;
+      padding-left: 18px;
+    }
+
+    .card {
+      padding: 24px;
+      display: grid;
+      gap: 14px;
+    }
+
+    .card h2 {
+      margin: 0;
+      font-size: 22px;
+      letter-spacing: -0.03em;
+    }
+
+    label {
+      display: grid;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    input,
+    button {
+      font: inherit;
+    }
+
+    input {
+      width: 100%;
+      padding: 12px 14px;
+      border-radius: 14px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.85);
+      color: var(--text);
+    }
+
+    input:focus {
+      outline: none;
+      border-color: rgba(179, 83, 47, 0.5);
+      box-shadow: 0 0 0 4px rgba(179, 83, 47, 0.12);
+    }
+
+    button {
+      appearance: none;
+      border: 0;
+      border-radius: 999px;
+      padding: 12px 16px;
+      color: #fff;
+      background: linear-gradient(135deg, #ca6943, var(--primary));
+      cursor: pointer;
+    }
+
+    .flash {
+      display: none;
+      padding: 12px 14px;
+      border-radius: 14px;
+      font-size: 13px;
+      line-height: 1.65;
+    }
+
+    .flash.error {
+      display: block;
+      color: var(--danger);
+      background: rgba(163, 63, 50, 0.12);
+    }
+
+    .flash.info {
+      display: block;
+      color: var(--secondary);
+      background: rgba(31, 108, 99, 0.12);
+    }
+
+    .hint {
+      margin: 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.7;
+    }
+
+    @media (max-width: 860px) {
+      .shell {
+        grid-template-columns: 1fr;
+      }
+      .hero,
+      .card {
+        border-radius: 22px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <section class="hero">
+      <h1>管理员登录</h1>
+      <p>这个后台现在使用独立的 <code>admin_users</code> 账号体系，不再复用普通 IM 用户，也不再依赖静态开发 token。</p>
+      <ul>
+        <li>登录成功后，服务端会写入 HTTP cookie session，仅对 <code>/admin/*</code> 生效。</li>
+        <li>文件上传、文件下载和上传 token 机制保持原样，不经过这里的管理员鉴权链路。</li>
+        <li>如果数据库里还没有管理员账号，首次访问会自动初始化一条引导账号。</li>
+      </ul>
+      <p class="hint">未覆盖环境变量时的默认引导账号：<code>__BOOTSTRAP_USERNAME__</code> / <code>__BOOTSTRAP_PASSWORD__</code>。上线前请通过环境变量覆盖并尽快修改密码。</p>
+    </section>
+
+    <section class="card">
+      <h2>登录后台</h2>
+      <div id="flash" class="flash"></div>
+      <form id="loginForm">
+        <label>
+          用户名
+          <input name="username" type="text" autocomplete="username" required maxlength="64" placeholder="管理员用户名">
+        </label>
+        <label>
+          密码
+          <input name="password" type="password" autocomplete="current-password" required maxlength="64" placeholder="管理员密码">
+        </label>
+        <button type="submit">登录</button>
+      </form>
+    </section>
+  </div>
+
+  <script>
+    (function () {
+      const flashEl = document.getElementById("flash");
+
+      function setFlash(message, type) {
+        flashEl.textContent = message || "";
+        flashEl.className = "flash " + (type || "error");
+      }
+
+      async function request(path, options) {
+        const response = await fetch(path, Object.assign({ credentials: "same-origin" }, options || {}));
+        const text = await response.text();
+        let payload = {};
+        if (text) {
+          try {
+            payload = JSON.parse(text);
+          } catch (error) {
+            throw new Error("服务端返回了非 JSON 响应");
+          }
+        }
+        if (!response.ok || payload.ok === false) {
+          throw new Error(payload.message || ("请求失败: HTTP " + response.status));
+        }
+        return payload;
+      }
+
+      request("/admin/api/session/me")
+        .then(function () {
+          window.location.replace("/admin/users");
+        })
+        .catch(function () {
+        });
+
+      document.getElementById("loginForm").addEventListener("submit", function (event) {
+        event.preventDefault();
+        const formData = new FormData(event.currentTarget);
+        request("/admin/api/session/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            username: String(formData.get("username") || ""),
+            password: String(formData.get("password") || "")
+          })
+        }).then(function () {
+          setFlash("登录成功，正在进入后台。", "info");
+          window.location.replace("/admin/users");
+        }).catch(function (error) {
+          setFlash(error.message, "error");
+        });
+      });
+    }());
+  </script>
+</body>
+</html>
+)PAGE";
+
+    page = replace_all(page, "__BOOTSTRAP_USERNAME__", default_bootstrap_admin_username());
+    page = replace_all(page, "__BOOTSTRAP_PASSWORD__", default_bootstrap_admin_password());
+    return page;
+}
 
 std::string build_dev_user_admin_page()
 {
-    std::string page = R"PAGE(<!doctype html>
+    return R"PAGE(<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
@@ -66,24 +294,18 @@ std::string build_dev_user_admin_page()
   <style>
     :root {
       --bg: #f4efe8;
-      --bg-accent: #e4ddd3;
       --panel: rgba(255, 252, 246, 0.94);
       --line: rgba(94, 76, 60, 0.16);
       --text: #2f241d;
       --muted: #6d5b4f;
       --primary: #b3532f;
-      --primary-soft: #f3d6c8;
       --secondary: #1f6c63;
-      --secondary-soft: #d7ece8;
       --danger: #a33f32;
-      --danger-soft: #f2d4d0;
       --shadow: 0 18px 40px rgba(90, 67, 48, 0.14);
       --radius: 18px;
     }
 
-    * {
-      box-sizing: border-box;
-    }
+    * { box-sizing: border-box; }
 
     body {
       margin: 0;
@@ -123,10 +345,10 @@ std::string build_dev_user_admin_page()
 
     .hero p {
       margin: 0;
-      max-width: 860px;
       color: var(--muted);
       font-size: 15px;
       line-height: 1.7;
+      max-width: 900px;
     }
 
     .hero-bar {
@@ -147,6 +369,13 @@ std::string build_dev_user_admin_page()
       color: var(--text);
       background: rgba(255, 255, 255, 0.72);
       border: 1px solid rgba(94, 76, 60, 0.11);
+    }
+
+    .hero-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 4px;
     }
 
     .layout {
@@ -201,22 +430,22 @@ std::string build_dev_user_admin_page()
       align-items: center;
     }
 
-    .toolbar-inline {
+    .toolbar-inline,
+    .actions {
       display: flex;
       flex-wrap: wrap;
       gap: 10px;
       align-items: center;
     }
 
-    .grid-2 {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 12px;
-    }
-
+    .grid-2,
     .grid-1 {
       display: grid;
       gap: 12px;
+    }
+
+    .grid-2 {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
     }
 
     label {
@@ -243,7 +472,6 @@ std::string build_dev_user_admin_page()
       border: 1px solid var(--line);
       background: rgba(255, 255, 255, 0.84);
       color: var(--text);
-      transition: border-color 120ms ease, box-shadow 120ms ease, transform 120ms ease;
     }
 
     input:focus,
@@ -252,7 +480,6 @@ std::string build_dev_user_admin_page()
       outline: none;
       border-color: rgba(179, 83, 47, 0.5);
       box-shadow: 0 0 0 4px rgba(179, 83, 47, 0.12);
-      transform: translateY(-1px);
     }
 
     textarea {
@@ -266,28 +493,21 @@ std::string build_dev_user_admin_page()
       border-radius: 999px;
       padding: 12px 16px;
       cursor: pointer;
-      transition: transform 120ms ease, box-shadow 120ms ease, opacity 120ms ease;
-    }
-
-    button:hover {
-      transform: translateY(-1px);
     }
 
     button:disabled {
-      cursor: not-allowed;
-      transform: none;
       opacity: 0.56;
+      cursor: not-allowed;
     }
 
     .primary-btn {
       color: #fff;
       background: linear-gradient(135deg, #ca6943, var(--primary));
-      box-shadow: 0 12px 24px rgba(179, 83, 47, 0.2);
     }
 
     .secondary-btn {
       color: var(--secondary);
-      background: var(--secondary-soft);
+      background: rgba(31, 108, 99, 0.12);
     }
 
     .ghost-btn {
@@ -298,14 +518,7 @@ std::string build_dev_user_admin_page()
 
     .danger-btn {
       color: var(--danger);
-      background: var(--danger-soft);
-    }
-
-    .hint {
-      margin: 0;
-      color: var(--muted);
-      font-size: 12px;
-      line-height: 1.65;
+      background: rgba(163, 63, 50, 0.12);
     }
 
     .flash {
@@ -320,20 +533,13 @@ std::string build_dev_user_admin_page()
     .flash.info {
       display: block;
       color: var(--secondary);
-      background: var(--secondary-soft);
+      background: rgba(31, 108, 99, 0.12);
     }
 
     .flash.error {
       display: block;
       color: var(--danger);
-      background: var(--danger-soft);
-    }
-
-    .token-row {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: 10px;
-      align-items: end;
+      background: rgba(163, 63, 50, 0.12);
     }
 
     .summary {
@@ -357,11 +563,11 @@ std::string build_dev_user_admin_page()
       letter-spacing: -0.04em;
     }
 
-    .summary-card span {
-      display: block;
-      margin-top: 4px;
+    .summary-card span,
+    .muted {
       color: var(--muted);
       font-size: 12px;
+      line-height: 1.55;
     }
 
     .table-wrap {
@@ -402,11 +608,6 @@ std::string build_dev_user_admin_page()
 
     tbody tr {
       cursor: pointer;
-      transition: background 120ms ease;
-    }
-
-    tbody tr:hover {
-      background: rgba(243, 214, 200, 0.26);
     }
 
     tbody tr.selected {
@@ -422,12 +623,6 @@ std::string build_dev_user_admin_page()
       font-size: 14px;
     }
 
-    .muted {
-      color: var(--muted);
-      font-size: 12px;
-      line-height: 1.55;
-    }
-
     .tag {
       display: inline-flex;
       align-items: center;
@@ -436,28 +631,12 @@ std::string build_dev_user_admin_page()
       border-radius: 999px;
       font-size: 12px;
       font-weight: 700;
-      white-space: nowrap;
     }
 
-    .tag.online {
-      color: var(--secondary);
-      background: var(--secondary-soft);
-    }
-
-    .tag.offline {
-      color: var(--muted);
-      background: rgba(109, 91, 79, 0.1);
-    }
-
-    .tag.enabled {
-      color: var(--secondary);
-      background: rgba(31, 108, 99, 0.12);
-    }
-
-    .tag.disabled {
-      color: var(--danger);
-      background: rgba(163, 63, 50, 0.12);
-    }
+    .tag.online { color: var(--secondary); background: rgba(31, 108, 99, 0.12); }
+    .tag.offline { color: var(--muted); background: rgba(109, 91, 79, 0.1); }
+    .tag.enabled { color: var(--secondary); background: rgba(31, 108, 99, 0.12); }
+    .tag.disabled { color: var(--danger); background: rgba(163, 63, 50, 0.12); }
 
     .selected-card {
       border-radius: 16px;
@@ -481,36 +660,14 @@ std::string build_dev_user_admin_page()
       line-height: 1.7;
     }
 
-    .actions {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-    }
-
     @media (max-width: 1100px) {
-      .layout {
-        grid-template-columns: 1fr;
-      }
+      .layout { grid-template-columns: 1fr; }
     }
 
     @media (max-width: 760px) {
-      .page {
-        width: min(100vw - 20px, 100%);
-        margin: 10px auto 28px;
-      }
-
-      .hero,
-      .panel-body,
-      .panel-head {
-        padding-left: 16px;
-        padding-right: 16px;
-      }
-
-      .toolbar,
-      .token-row,
-      .grid-2 {
-        grid-template-columns: 1fr;
-      }
+      .page { width: min(100vw - 20px, 100%); margin: 10px auto 28px; }
+      .hero, .panel-body, .panel-head { padding-left: 16px; padding-right: 16px; }
+      .toolbar, .grid-2 { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -518,11 +675,15 @@ std::string build_dev_user_admin_page()
   <div class="page">
     <section class="hero">
       <h1>开发者用户管理后台</h1>
-      <p>这个页面直接挂在当前 server 的 HTTP 端口上，用来给开发人员做内部用户运维。它适合列表查询、创建账号、修改基础资料、启停账号和重置密码这类请求-响应型操作，因此这里采用 HTTP，而不是再走一层 WebSocket 管理协议。</p>
+      <p>后台鉴权现在使用独立的 <code>admin_users</code> 账号体系，HTTP 页面和接口通过 cookie session 识别管理员身份。普通 IM 用户表、文件上传 token、聊天文件下载校验都保持原样，不会穿过这条后台登录链路。</p>
       <div class="hero-bar">
         <span class="pill">页面路由: <strong>/admin/users</strong></span>
-        <span class="pill">接口前缀: <strong>/admin/api/users</strong></span>
-        <span class="pill">鉴权头: <strong>X-Dev-Admin-Token</strong></span>
+        <span class="pill">登录路由: <strong>/admin/login</strong></span>
+        <span class="pill" id="adminBadge">当前管理员: 加载中</span>
+      </div>
+      <div class="hero-actions">
+        <button id="refreshBtn" type="button" class="primary-btn">刷新列表</button>
+        <button id="logoutBtn" type="button" class="ghost-btn">退出登录</button>
       </div>
     </section>
 
@@ -536,17 +697,7 @@ std::string build_dev_user_admin_page()
         </div>
         <div class="panel-body">
           <div id="flash" class="flash"></div>
-
           <form id="searchForm" class="grid-1">
-            <div class="token-row">
-              <label>
-                管理 Token
-                <input id="tokenInput" type="password" autocomplete="off" placeholder="默认 token 已预填，可按需覆盖">
-              </label>
-              <button id="saveTokenBtn" type="button" class="ghost-btn">保存 Token</button>
-            </div>
-            <p class="hint">默认 token: `__DEFAULT_TOKEN__`。如需覆盖，请设置环境变量 `QT_SERVER_DEV_ADMIN_TOKEN` 并重启服务。</p>
-
             <div class="toolbar">
               <label>
                 搜索用户
@@ -564,7 +715,7 @@ std::string build_dev_user_admin_page()
                 <input id="includeDisabledInput" type="checkbox" checked>
                 包含已禁用
               </label>
-              <button type="submit" class="primary-btn">刷新列表</button>
+              <button type="submit" class="primary-btn">查询</button>
             </div>
           </form>
 
@@ -596,9 +747,7 @@ std::string build_dev_user_admin_page()
                 </tr>
               </thead>
               <tbody id="usersBody">
-                <tr>
-                  <td colspan="6" class="muted">正在等待首次加载。</td>
-                </tr>
+                <tr><td colspan="6" class="muted">正在等待首次加载。</td></tr>
               </tbody>
             </table>
           </div>
@@ -610,7 +759,7 @@ std::string build_dev_user_admin_page()
           <div class="panel-head">
             <div>
               <h2>创建用户</h2>
-              <p>创建逻辑沿用现有业务规则：用户名 3~32，仅字母数字下划线；密码 8~64，且必须包含大小写字母和数字。</p>
+              <p>创建普通 IM 用户，不会影响管理员账号体系。</p>
             </div>
           </div>
           <div class="panel-body">
@@ -625,7 +774,6 @@ std::string build_dev_user_admin_page()
                   <input name="nickname" type="text" required maxlength="64" placeholder="显示给客户端的昵称">
                 </label>
               </div>
-
               <div class="grid-2">
                 <label>
                   邮箱
@@ -636,7 +784,6 @@ std::string build_dev_user_admin_page()
                   <input name="phone" type="text" maxlength="32" placeholder="可选">
                 </label>
               </div>
-
               <div class="grid-2">
                 <label>
                   初始密码
@@ -650,17 +797,14 @@ std::string build_dev_user_admin_page()
                   </select>
                 </label>
               </div>
-
               <label>
                 头像 URL
                 <input name="avatar_url" type="text" maxlength="255" placeholder="可选">
               </label>
-
               <label>
                 简介
                 <textarea name="bio" maxlength="255" placeholder="可选"></textarea>
               </label>
-
               <div class="actions">
                 <button type="submit" class="primary-btn">创建用户</button>
                 <button type="reset" class="ghost-btn">清空表单</button>
@@ -673,7 +817,7 @@ std::string build_dev_user_admin_page()
           <div class="panel-head">
             <div>
               <h2>编辑选中用户</h2>
-              <p>这里不开放删除，避免误删关联数据。停用账号通过 `status=0` 完成。</p>
+              <p>这里不开放删除，避免误删聊天和文件关联数据。</p>
             </div>
           </div>
           <div class="panel-body">
@@ -686,38 +830,34 @@ std::string build_dev_user_admin_page()
               <div class="grid-2">
                 <label>
                   邮箱
-                  <input id="editEmail" name="email" type="email" required maxlength="128">
+                  <input id="editEmail" type="email" required maxlength="128">
                 </label>
                 <label>
                   手机号
-                  <input id="editPhone" name="phone" type="text" maxlength="32">
+                  <input id="editPhone" type="text" maxlength="32">
                 </label>
               </div>
-
               <div class="grid-2">
                 <label>
                   昵称
-                  <input id="editNickname" name="nickname" type="text" required maxlength="64">
+                  <input id="editNickname" type="text" required maxlength="64">
                 </label>
                 <label>
                   账号状态
-                  <select id="editStatus" name="status">
+                  <select id="editStatus">
                     <option value="1">启用</option>
                     <option value="0">禁用</option>
                   </select>
                 </label>
               </div>
-
               <label>
                 头像 URL
-                <input id="editAvatarUrl" name="avatar_url" type="text" maxlength="255">
+                <input id="editAvatarUrl" type="text" maxlength="255">
               </label>
-
               <label>
                 简介
-                <textarea id="editBio" name="bio" maxlength="255"></textarea>
+                <textarea id="editBio" maxlength="255"></textarea>
               </label>
-
               <div class="actions">
                 <button id="saveUserBtn" type="submit" class="secondary-btn" disabled>保存修改</button>
               </div>
@@ -728,7 +868,7 @@ std::string build_dev_user_admin_page()
             <form id="resetPasswordForm" class="grid-1">
               <label>
                 新密码
-                <input id="resetPasswordInput" name="password" type="password" required minlength="8" maxlength="64" placeholder="必须包含大小写字母和数字">
+                <input id="resetPasswordInput" type="password" required minlength="8" maxlength="64" placeholder="必须包含大小写字母和数字">
               </label>
               <div class="actions">
                 <button id="resetPasswordBtn" type="submit" class="danger-btn" disabled>重置密码</button>
@@ -742,27 +882,19 @@ std::string build_dev_user_admin_page()
 
   <script>
     (function () {
-      const TOKEN_KEY = "qt-server-dev-admin-token";
-      const DEFAULT_TOKEN = "__DEFAULT_TOKEN_JS__";
       const state = {
-        token: localStorage.getItem(TOKEN_KEY) || DEFAULT_TOKEN,
+        admin: null,
         users: [],
         selectedUserId: null
       };
 
       const flashEl = document.getElementById("flash");
-      const tokenInput = document.getElementById("tokenInput");
-      const keywordInput = document.getElementById("keywordInput");
-      const limitInput = document.getElementById("limitInput");
-      const includeDisabledInput = document.getElementById("includeDisabledInput");
       const usersBody = document.getElementById("usersBody");
       const countAll = document.getElementById("countAll");
       const countEnabled = document.getElementById("countEnabled");
       const countOnline = document.getElementById("countOnline");
       const saveUserBtn = document.getElementById("saveUserBtn");
       const resetPasswordBtn = document.getElementById("resetPasswordBtn");
-
-      tokenInput.value = state.token;
 
       function escapeHtml(value) {
         return String(value == null ? "" : value)
@@ -778,28 +910,8 @@ std::string build_dev_user_admin_page()
         flashEl.className = "flash " + (type || "info");
       }
 
-      function clearFlash() {
-        flashEl.textContent = "";
-        flashEl.className = "flash";
-      }
-
-      function saveToken() {
-        state.token = tokenInput.value.trim();
-        localStorage.setItem(TOKEN_KEY, state.token);
-      }
-
-      function getJsonHeaders() {
-        return {
-          "Content-Type": "application/json",
-          "X-Dev-Admin-Token": state.token
-        };
-      }
-
       async function api(path, options) {
-        if (!state.token) {
-          throw new Error("请先填写开发者管理 Token");
-        }
-        const response = await fetch(path, options || {});
+        const response = await fetch(path, Object.assign({ credentials: "same-origin" }, options || {}));
         const text = await response.text();
         let payload = {};
         if (text) {
@@ -809,10 +921,24 @@ std::string build_dev_user_admin_page()
             throw new Error("服务端返回了非 JSON 响应");
           }
         }
+        if (response.status === 401) {
+          window.location.replace("/admin/login");
+          throw new Error(payload.message || "管理员会话已失效");
+        }
         if (!response.ok || payload.ok === false) {
           throw new Error(payload.message || ("请求失败: HTTP " + response.status));
         }
         return payload;
+      }
+
+      function renderAdminBadge() {
+        const badge = document.getElementById("adminBadge");
+        if (!state.admin) {
+          badge.innerHTML = "当前管理员: 未登录";
+          return;
+        }
+        const displayName = state.admin.display_name || state.admin.username;
+        badge.innerHTML = "当前管理员: <strong>" + escapeHtml(displayName) + "</strong>";
       }
 
       function updateSummary() {
@@ -908,34 +1034,42 @@ std::string build_dev_user_admin_page()
       }
 
       async function loadUsers() {
-        saveToken();
-        clearFlash();
         const params = new URLSearchParams();
-        const keyword = keywordInput.value.trim();
+        const keyword = document.getElementById("keywordInput").value.trim();
         if (keyword) {
           params.set("keyword", keyword);
         }
-        params.set("limit", limitInput.value);
-        params.set("include_disabled", includeDisabledInput.checked ? "1" : "0");
-        const payload = await api("/admin/api/users?" + params.toString(), {
-          headers: {
-            "X-Dev-Admin-Token": state.token
-          }
-        });
+        params.set("limit", document.getElementById("limitInput").value);
+        params.set("include_disabled", document.getElementById("includeDisabledInput").checked ? "1" : "0");
+        const payload = await api("/admin/api/users?" + params.toString());
         state.users = Array.isArray(payload.users) ? payload.users : [];
-        const selectedStillExists = state.users.some(function (user) {
-          return String(user.user_id) === String(state.selectedUserId);
-        });
-        if (!selectedStillExists) {
+        if (!state.users.some(function (user) { return String(user.user_id) === String(state.selectedUserId); })) {
           state.selectedUserId = state.users.length ? String(state.users[0].user_id) : null;
         }
         renderUsers();
         setFlash("用户列表已刷新。", "info");
       }
 
-      document.getElementById("saveTokenBtn").addEventListener("click", function () {
-        saveToken();
-        setFlash("管理 Token 已保存到浏览器本地存储。", "info");
+      async function loadSession() {
+        const payload = await api("/admin/api/session/me");
+        state.admin = payload.admin || null;
+        renderAdminBadge();
+      }
+
+      document.getElementById("refreshBtn").addEventListener("click", function () {
+        loadUsers().catch(function (error) {
+          setFlash(error.message, "error");
+        });
+      });
+
+      document.getElementById("logoutBtn").addEventListener("click", function () {
+        api("/admin/api/session/logout", { method: "POST" })
+          .then(function () {
+            window.location.replace("/admin/login");
+          })
+          .catch(function () {
+            window.location.replace("/admin/login");
+          });
       });
 
       document.getElementById("searchForm").addEventListener("submit", function (event) {
@@ -949,20 +1083,19 @@ std::string build_dev_user_admin_page()
         event.preventDefault();
         const form = event.currentTarget;
         const formData = new FormData(form);
-        const payload = {
-          username: String(formData.get("username") || ""),
-          nickname: String(formData.get("nickname") || ""),
-          email: String(formData.get("email") || ""),
-          phone: String(formData.get("phone") || ""),
-          password: String(formData.get("password") || ""),
-          status: Number(formData.get("status") || 1),
-          avatar_url: String(formData.get("avatar_url") || ""),
-          bio: String(formData.get("bio") || "")
-        };
         api("/admin/api/users", {
           method: "POST",
-          headers: getJsonHeaders(),
-          body: JSON.stringify(payload)
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            username: String(formData.get("username") || ""),
+            nickname: String(formData.get("nickname") || ""),
+            email: String(formData.get("email") || ""),
+            phone: String(formData.get("phone") || ""),
+            password: String(formData.get("password") || ""),
+            status: Number(formData.get("status") || 1),
+            avatar_url: String(formData.get("avatar_url") || ""),
+            bio: String(formData.get("bio") || "")
+          })
         }).then(function (response) {
           form.reset();
           state.selectedUserId = response.user ? String(response.user.user_id) : null;
@@ -981,18 +1114,17 @@ std::string build_dev_user_admin_page()
           setFlash("请先选择一个用户。", "error");
           return;
         }
-        const payload = {
-          email: document.getElementById("editEmail").value,
-          phone: document.getElementById("editPhone").value,
-          nickname: document.getElementById("editNickname").value,
-          status: Number(document.getElementById("editStatus").value),
-          avatar_url: document.getElementById("editAvatarUrl").value,
-          bio: document.getElementById("editBio").value
-        };
         api("/admin/api/users/" + encodeURIComponent(String(user.user_id)), {
           method: "PATCH",
-          headers: getJsonHeaders(),
-          body: JSON.stringify(payload)
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            email: document.getElementById("editEmail").value,
+            phone: document.getElementById("editPhone").value,
+            nickname: document.getElementById("editNickname").value,
+            status: Number(document.getElementById("editStatus").value),
+            avatar_url: document.getElementById("editAvatarUrl").value,
+            bio: document.getElementById("editBio").value
+          })
         }).then(function () {
           return loadUsers().then(function () {
             state.selectedUserId = String(user.user_id);
@@ -1011,11 +1143,10 @@ std::string build_dev_user_admin_page()
           setFlash("请先选择一个用户。", "error");
           return;
         }
-        const password = document.getElementById("resetPasswordInput").value;
         api("/admin/api/users/" + encodeURIComponent(String(user.user_id)) + "/reset-password", {
           method: "POST",
-          headers: getJsonHeaders(),
-          body: JSON.stringify({ password: password })
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ password: document.getElementById("resetPasswordInput").value })
         }).then(function () {
           document.getElementById("resetPasswordInput").value = "";
           setFlash("密码已重置。", "info");
@@ -1024,19 +1155,16 @@ std::string build_dev_user_admin_page()
         });
       });
 
-      renderUsers();
-      loadUsers().catch(function (error) {
-        setFlash(error.message, "error");
-      });
+      loadSession()
+        .then(loadUsers)
+        .catch(function (error) {
+          setFlash(error.message, "error");
+        });
     }());
   </script>
 </body>
 </html>
 )PAGE";
-
-    page = replace_all(page, "__DEFAULT_TOKEN__", default_dev_admin_token());
-    page = replace_all(page, "__DEFAULT_TOKEN_JS__", js_escape(default_dev_admin_token()));
-    return page;
 }
 
 } // namespace server

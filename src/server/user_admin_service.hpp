@@ -82,6 +82,24 @@ struct update_user_request
     unsigned int status = 1U;
 };
 
+struct admin_user_account
+{
+    unsigned long long admin_user_id = 0ULL;
+    std::string username;
+    std::string display_name;
+    unsigned int status = 0U;
+    std::string last_login_at;
+    std::string created_at;
+    std::string updated_at;
+};
+
+struct admin_login_result
+{
+    admin_user_account admin;
+    std::string session_token;
+    int session_ttl_seconds = 0;
+};
+
 bool list_managed_users(const user_list_options& options,
                         std::vector<managed_user_record>& users,
                         user_admin_error& error);
@@ -95,8 +113,18 @@ bool reset_managed_user_password(unsigned long long user_id,
                                  const std::string& new_password,
                                  user_admin_error& error);
 
-std::string default_dev_admin_token();
-bool is_dev_admin_token_valid(const std::string& token);
+bool login_admin_user(const std::string& username,
+                      const std::string& password,
+                      admin_login_result& result,
+                      user_admin_error& error);
+bool validate_admin_session(const std::string& session_token,
+                            admin_user_account& admin,
+                            user_admin_error& error);
+void logout_admin_session(const std::string& session_token);
+std::string admin_session_cookie_name();
+int admin_session_ttl_seconds();
+std::string default_bootstrap_admin_username();
+std::string default_bootstrap_admin_password();
 
 } // namespace server
 } // namespace qt_server
