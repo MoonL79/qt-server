@@ -1,34 +1,13 @@
 #include "dev_user_admin_page.hpp"
 
-#include "user_admin_service.hpp"
-
 #include <string>
 
 namespace qt_server {
 namespace server {
 
-namespace {
-
-std::string replace_all(std::string text,
-                        const std::string& needle,
-                        const std::string& replacement)
-{
-    if (needle.empty()) {
-        return text;
-    }
-    std::size_t pos = 0U;
-    while ((pos = text.find(needle, pos)) != std::string::npos) {
-        text.replace(pos, needle.size(), replacement);
-        pos += replacement.size();
-    }
-    return text;
-}
-
-} // namespace
-
 std::string build_dev_admin_login_page()
 {
-    std::string page = R"PAGE(<!doctype html>
+    return R"PAGE(<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
@@ -63,48 +42,12 @@ std::string build_dev_admin_login_page()
       padding: 18px;
     }
 
-    .shell {
-      width: min(960px, 100%);
-      display: grid;
-      grid-template-columns: minmax(0, 1.15fr) minmax(320px, 0.85fr);
-      gap: 18px;
-      align-items: stretch;
-    }
-
-    .hero,
     .card {
+      width: min(420px, 100%);
       background: var(--panel);
       border: 1px solid rgba(255, 255, 255, 0.56);
       border-radius: 28px;
       box-shadow: var(--shadow);
-    }
-
-    .hero {
-      padding: 30px;
-      display: grid;
-      gap: 16px;
-    }
-
-    .hero h1 {
-      margin: 0;
-      font-size: clamp(30px, 4vw, 44px);
-      line-height: 1.04;
-      letter-spacing: -0.04em;
-    }
-
-    .hero p,
-    .hero li {
-      color: var(--muted);
-      line-height: 1.75;
-      font-size: 14px;
-    }
-
-    .hero ul {
-      margin: 0;
-      padding-left: 18px;
-    }
-
-    .card {
       padding: 24px;
       display: grid;
       gap: 14px;
@@ -114,6 +57,11 @@ std::string build_dev_admin_login_page()
       margin: 0;
       font-size: 22px;
       letter-spacing: -0.03em;
+    }
+
+    #loginForm {
+      display: grid;
+      gap: 12px;
     }
 
     label {
@@ -154,6 +102,10 @@ std::string build_dev_admin_login_page()
       cursor: pointer;
     }
 
+    #loginForm button {
+      margin-top: 6px;
+    }
+
     .flash {
       display: none;
       padding: 12px 14px;
@@ -174,53 +126,30 @@ std::string build_dev_admin_login_page()
       background: rgba(31, 108, 99, 0.12);
     }
 
-    .hint {
-      margin: 0;
-      color: var(--muted);
-      font-size: 12px;
-      line-height: 1.7;
-    }
-
-    @media (max-width: 860px) {
-      .shell {
-        grid-template-columns: 1fr;
-      }
-      .hero,
+    @media (max-width: 520px) {
       .card {
         border-radius: 22px;
+        padding: 20px;
       }
     }
   </style>
 </head>
 <body>
-  <div class="shell">
-    <section class="hero">
-      <h1>管理员登录</h1>
-      <p>这个后台现在使用独立的 <code>admin_users</code> 账号体系，不再复用普通 IM 用户，也不再依赖静态开发 token。</p>
-      <ul>
-        <li>登录成功后，服务端会写入 HTTP cookie session，仅对 <code>/admin/*</code> 生效。</li>
-        <li>文件上传、文件下载和上传 token 机制保持原样，不经过这里的管理员鉴权链路。</li>
-        <li>如果数据库里还没有管理员账号，首次访问会自动初始化一条引导账号。</li>
-      </ul>
-      <p class="hint">未覆盖环境变量时的默认引导账号：<code>__BOOTSTRAP_USERNAME__</code> / <code>__BOOTSTRAP_PASSWORD__</code>。上线前请通过环境变量覆盖并尽快修改密码。</p>
-    </section>
-
-    <section class="card">
-      <h2>登录后台</h2>
-      <div id="flash" class="flash"></div>
-      <form id="loginForm">
-        <label>
-          用户名
-          <input name="username" type="text" autocomplete="username" required maxlength="64" placeholder="管理员用户名">
-        </label>
-        <label>
-          密码
-          <input name="password" type="password" autocomplete="current-password" required maxlength="64" placeholder="管理员密码">
-        </label>
-        <button type="submit">登录</button>
-      </form>
-    </section>
-  </div>
+  <section class="card">
+    <h2>管理员登录</h2>
+    <div id="flash" class="flash"></div>
+    <form id="loginForm">
+      <label>
+        用户名
+        <input name="username" type="text" autocomplete="username" required maxlength="64" placeholder="管理员用户名">
+      </label>
+      <label>
+        密码
+        <input name="password" type="password" autocomplete="current-password" required maxlength="64" placeholder="管理员密码">
+      </label>
+      <button type="submit">登录</button>
+    </form>
+  </section>
 
   <script>
     (function () {
@@ -277,10 +206,6 @@ std::string build_dev_admin_login_page()
 </body>
 </html>
 )PAGE";
-
-    page = replace_all(page, "__BOOTSTRAP_USERNAME__", default_bootstrap_admin_username());
-    page = replace_all(page, "__BOOTSTRAP_PASSWORD__", default_bootstrap_admin_password());
-    return page;
 }
 
 std::string build_dev_user_admin_page()
@@ -326,6 +251,7 @@ std::string build_dev_user_admin_page()
     .hero {
       display: grid;
       gap: 14px;
+      justify-items: center;
       padding: 28px;
       border: 1px solid rgba(255, 255, 255, 0.48);
       border-radius: 28px;
@@ -356,6 +282,7 @@ std::string build_dev_user_admin_page()
       flex-wrap: wrap;
       gap: 12px;
       align-items: center;
+      justify-content: center;
       margin-top: 6px;
     }
 
@@ -375,6 +302,7 @@ std::string build_dev_user_admin_page()
       display: flex;
       flex-wrap: wrap;
       gap: 10px;
+      justify-content: center;
       margin-top: 4px;
     }
 
@@ -675,10 +603,7 @@ std::string build_dev_user_admin_page()
   <div class="page">
     <section class="hero">
       <h1>开发者用户管理后台</h1>
-      <p>后台鉴权现在使用独立的 <code>admin_users</code> 账号体系，HTTP 页面和接口通过 cookie session 识别管理员身份。普通 IM 用户表、文件上传 token、聊天文件下载校验都保持原样，不会穿过这条后台登录链路。</p>
       <div class="hero-bar">
-        <span class="pill">页面路由: <strong>/admin/users</strong></span>
-        <span class="pill">登录路由: <strong>/admin/login</strong></span>
         <span class="pill" id="adminBadge">当前管理员: 加载中</span>
       </div>
       <div class="hero-actions">
