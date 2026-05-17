@@ -35,6 +35,8 @@ const char* k_avatar_upload_purpose = "avatar_upload";
 const char* k_chat_file_token_purpose = "chat_file";
 const unsigned long long k_text_message_type = 1ULL;
 const unsigned long long k_file_message_type = 2ULL;
+const unsigned long long k_message_pull_default_limit = 100ULL;
+const unsigned long long k_message_pull_max_limit = 200ULL;
 
 struct mysql_config
 {
@@ -43,6 +45,14 @@ struct mysql_config
     std::string database;
     std::string user;
     std::string password;
+};
+
+struct conversation_message_summary
+{
+    std::string updated_at;
+    unsigned long long last_message_seq = 0ULL;
+    std::string last_message_id;
+    std::string last_message_sent_at;
 };
 
 json::object build_mysql_config_debug(const mysql_config& cfg);
@@ -753,6 +763,48 @@ bool parse_unsigned_long_long(const std::string& input, unsigned long long& valu
     return !iss.fail();
 }
 
+bool parse_json_unsigned_value(const json::value& raw_value,
+                               unsigned long long& value)
+{
+    value = 0ULL;
+    if (raw_value.is_uint64()) {
+        value = raw_value.as_uint64();
+        return true;
+    }
+    if (raw_value.is_int64()) {
+        const std::int64_t signed_value = raw_value.as_int64();
+        if (signed_value < 0) {
+            return false;
+        }
+        value = static_cast<unsigned long long>(signed_value);
+        return true;
+    }
+    if (raw_value.is_string()) {
+        return parse_unsigned_long_long(trim_copy(std::string(raw_value.as_string().c_str())), value);
+    }
+    return false;
+}
+
+bool read_optional_unsigned_field(const json::object& obj,
+                                  const char* field,
+                                  unsigned long long& value,
+                                  bool& present,
+                                  std::string& error_message)
+{
+    value = 0ULL;
+    present = false;
+    const auto it = obj.find(field);
+    if (it == obj.end()) {
+        return true;
+    }
+    if (!parse_json_unsigned_value(it->value(), value)) {
+        error_message = std::string("field 'data.") + field + "' must be a non-negative integer";
+        return false;
+    }
+    present = true;
+    return true;
+}
+
 std::vector<std::string> split_by_tab(const std::string& input)
 {
     std::vector<std::string> parts;
@@ -804,6 +856,189 @@ bool parse_profile_row_line(const std::string& row_line,
     if (theme.empty()) {
         theme = "default";
     }
+    return true;
+}
+
+bool load_conversation_message_summary(const mysql_config& cfg,
+                                       const std::string& conversation_uuid,
+                                       conversation_message_summary& summary,
+                                       std::string& command_output,
+                                       int& exit_code)
+{
+    summary = conversation_message_summary{};
+    std::ostringstream sql;
+    sql << "SELECT "
+        << "COALESCE(DATE_FORMAT(c.updated_at, '%Y-%m-%dT%H:%i:%sZ'), ''), "
+        << "COALESCE(m.seq, 0), "
+        << "COALESCE(m.message_uuid, ''), "
+        << "COALESCE(DATE_FORMAT(m.created_at, '%Y-%m-%dT%H:%i:%sZ'), '') "
+        << "FROM conversations c "
+        << "LEFT JOIN messages m ON m.id=c.last_message_id "
+        << "WHERE c.conversation_uuid='" << sql_escape(conversation_uuid) << "' "
+        << "LIMIT 1;";
+
+    if (!run_mysql_sql(cfg, sql.str(), command_output, exit_code)) {
+        return false;
+    }
+
+    const std::vector<std::string> lines = collect_non_empty_lines(command_output);
+    if (lines.empty()) {
+        command_output = "missing conversation summary row";
+        exit_code = -1;
+        return false;
+    }
+
+    const std::vector<std::string> cols = split_by_tab(lines.front());
+    if (cols.size() < 4U
+        || !parse_unsigned_long_long(cols[1], summary.last_message_seq)) {
+        command_output = "malformed conversation summary row";
+        exit_code = -1;
+        return false;
+    }
+
+    summary.updated_at = (cols[0] == "\\N") ? "" : cols[0];
+    summary.last_message_id = (cols[2] == "\\N") ? "" : cols[2];
+    summary.last_message_sent_at = (cols[3] == "\\N") ? "" : cols[3];
+    return true;
+}
+
+void append_conversation_message_summary(json::object& item,
+                                         const conversation_message_summary& summary)
+{
+    item["updated_at"] = summary.updated_at;
+    item["last_message_seq"] = static_cast<std::uint64_t>(summary.last_message_seq);
+    item["last_message_id"] = summary.last_message_id;
+    item["last_message_sent_at"] = summary.last_message_sent_at;
+}
+
+bool resolve_conversation_for_user(const mysql_config& cfg,
+                                   const std::string& conversation_uuid,
+                                   unsigned long long user_id,
+                                   unsigned long long& internal_conversation_id,
+                                   unsigned long long& conversation_type,
+                                   bool& conversation_exists,
+                                   bool& is_member,
+                                   std::string& command_output,
+                                   int& exit_code)
+{
+    internal_conversation_id = 0ULL;
+    conversation_type = 0ULL;
+    conversation_exists = false;
+    is_member = false;
+
+    std::ostringstream conversation_sql;
+    conversation_sql << "SELECT id, type "
+                     << "FROM conversations "
+                     << "WHERE conversation_uuid='" << sql_escape(conversation_uuid) << "' "
+                     << "LIMIT 1;";
+
+    if (!run_mysql_sql(cfg, conversation_sql.str(), command_output, exit_code)) {
+        return false;
+    }
+
+    const std::vector<std::string> conversation_lines = collect_non_empty_lines(command_output);
+    if (conversation_lines.empty()) {
+        return true;
+    }
+
+    const std::vector<std::string> conversation_cols = split_by_tab(trim_copy(conversation_lines.front()));
+    if (conversation_cols.size() < 2U
+        || !parse_unsigned_long_long(conversation_cols[0], internal_conversation_id)
+        || !parse_unsigned_long_long(conversation_cols[1], conversation_type)
+        || internal_conversation_id == 0ULL) {
+        command_output = "unexpected conversation lookup output";
+        exit_code = -1;
+        return false;
+    }
+    conversation_exists = true;
+
+    std::ostringstream membership_sql;
+    membership_sql << "SELECT 1 "
+                   << "FROM conversation_members "
+                   << "WHERE conversation_id=" << internal_conversation_id
+                   << " AND user_id=" << user_id
+                   << " LIMIT 1;";
+
+    command_output.clear();
+    exit_code = 0;
+    if (!run_mysql_sql(cfg, membership_sql.str(), command_output, exit_code)) {
+        return false;
+    }
+
+    is_member = !collect_non_empty_lines(command_output).empty();
+    return true;
+}
+
+bool build_pulled_message_item(const std::string& conversation_id,
+                               unsigned long long conversation_type,
+                               const std::vector<std::string>& cols,
+                               json::object& item,
+                               unsigned long long& message_seq,
+                               std::string& error_message)
+{
+    item = {};
+    message_seq = 0ULL;
+    if (cols.size() < 8U) {
+        error_message = "unexpected message row format";
+        return false;
+    }
+
+    unsigned long long message_type = 0ULL;
+    unsigned long long sender_user_id = 0ULL;
+    unsigned long long sender_numeric_id = 0ULL;
+    if (!parse_unsigned_long_long(cols[1], message_seq)
+        || !parse_unsigned_long_long(cols[2], message_type)
+        || !parse_unsigned_long_long(cols[5], sender_user_id)
+        || !parse_unsigned_long_long(cols[6], sender_numeric_id)) {
+        error_message = "unexpected message row value";
+        return false;
+    }
+
+    const std::string content_json = (cols[3] == "\\N") ? "{}" : cols[3];
+    boost::system::error_code ec;
+    json::value content_value = json::parse(content_json, ec);
+    if (ec || !content_value.is_object()) {
+        error_message = "malformed message content json";
+        return false;
+    }
+
+    const json::object& content_obj = content_value.as_object();
+    item["conversation_id"] = conversation_id;
+    item["message_id"] = (cols[0] == "\\N") ? "" : cols[0];
+    item["seq"] = static_cast<std::uint64_t>(message_seq);
+    item["message_type"] = static_cast<std::uint64_t>(message_type);
+    item["conversation_type"] = static_cast<std::uint64_t>(conversation_type);
+    item["sent_at"] = (cols[4] == "\\N") ? "" : cols[4];
+    item["from_user_id"] = std::to_string(sender_user_id);
+    item["from_numeric_id"] = std::to_string(sender_numeric_id);
+    item["from_username"] = (cols[7] == "\\N") ? "" : cols[7];
+
+    if (message_type == k_text_message_type) {
+        item["message_kind"] = "text";
+        item["content"] = read_string_or_empty(content_obj, "text");
+        return true;
+    }
+
+    if (message_type == k_file_message_type) {
+        item["message_kind"] = "file";
+        json::object file_data;
+        file_data["file_id"] = read_string_or_empty(content_obj, "file_id");
+        file_data["original_name"] = read_string_or_empty(content_obj, "original_name");
+        file_data["stored_name"] = read_string_or_empty(content_obj, "stored_name");
+        unsigned long long size_bytes = 0ULL;
+        const auto size_it = content_obj.find("size_bytes");
+        if (size_it != content_obj.end()) {
+            parse_json_unsigned_value(size_it->value(), size_bytes);
+        }
+        file_data["size_bytes"] = static_cast<std::uint64_t>(size_bytes);
+        file_data["content_type"] = read_string_or_empty(content_obj, "content_type");
+        file_data["sha256"] = read_string_or_empty(content_obj, "sha256");
+        item["file"] = std::move(file_data);
+        return true;
+    }
+
+    item["message_kind"] = "unknown";
+    item["content_json"] = std::move(content_value);
     return true;
 }
 
@@ -1604,12 +1839,29 @@ bool websocket_session::validate_data_schema(const std::string& type,
                 error_code = protocol_code::MESSAGE_INVALID;
                 return false;
             }
+            unsigned long long ignored_value = 0ULL;
+            bool present = false;
+            if (!read_optional_unsigned_field(data, "after_seq", ignored_value, present, error_message)
+                || !read_optional_unsigned_field(data, "limit", ignored_value, present, error_message)) {
+                error_code = protocol_code::MESSAGE_INVALID;
+                return false;
+            }
             return true;
         }
         if (action == "ACK") {
             if (!require_string_field(data, "conversation_id", error_message)
-                || !require_string_field(data, "message_id", error_message)
                 || !require_bool_field(data, "delivered", error_message)) {
+                error_code = protocol_code::MESSAGE_INVALID;
+                return false;
+            }
+            unsigned long long ignored_value = 0ULL;
+            bool has_up_to_seq = false;
+            if (!read_optional_unsigned_field(data, "up_to_seq", ignored_value, has_up_to_seq, error_message)) {
+                error_code = protocol_code::MESSAGE_INVALID;
+                return false;
+            }
+            if (!has_up_to_seq && trim_copy(read_string_or_empty(data, "message_id")).empty()) {
+                error_message = "field 'data.up_to_seq' or 'data.message_id' is required";
                 error_code = protocol_code::MESSAGE_INVALID;
                 return false;
             }
@@ -3401,6 +3653,22 @@ bool websocket_session::handle_profile_list_conversations(const json::object& da
             return false;
         }
 
+        conversation_message_summary summary;
+        std::string summary_output;
+        int summary_exit_code = 0;
+        if (!load_conversation_message_summary(cfg,
+                                               conversation_uuid,
+                                               summary,
+                                               summary_output,
+                                               summary_exit_code)) {
+            response_code = protocol_code::INTERNAL_ERROR;
+            message = "list conversations failed: unable to load conversation summary";
+            response_data["debug"].as_object()["conversation_user_id"] = std::to_string(peer_user_id);
+            response_data["debug"].as_object()["summary_mysql_exit_code"] = summary_exit_code;
+            response_data["debug"].as_object()["summary_mysql_output"] = summary_output;
+            return false;
+        }
+
         json::object item;
         item["conversation_id"] = conversation_uuid;
         item["conversation_uuid"] = conversation_uuid;
@@ -3416,6 +3684,7 @@ bool websocket_session::handle_profile_list_conversations(const json::object& da
         item["peer_status"] = static_cast<int>(user_status);
         item["peer_is_online"] = (is_online != 0ULL);
         item["peer_last_seen_at"] = peer_last_seen_at;
+        append_conversation_message_summary(item, summary);
         conversations.push_back(std::move(item));
     }
 
@@ -3486,6 +3755,22 @@ bool websocket_session::handle_profile_list_conversations(const json::object& da
         item["peer_status"] = 0;
         item["peer_is_online"] = false;
         item["peer_last_seen_at"] = "";
+        conversation_message_summary summary;
+        std::string summary_output;
+        int summary_exit_code = 0;
+        if (!load_conversation_message_summary(cfg,
+                                               cols[0],
+                                               summary,
+                                               summary_output,
+                                               summary_exit_code)) {
+            response_code = protocol_code::INTERNAL_ERROR;
+            message = "list conversations failed: unable to load conversation summary";
+            response_data["debug"].as_object()["conversation_id"] = cols[0];
+            response_data["debug"].as_object()["summary_mysql_exit_code"] = summary_exit_code;
+            response_data["debug"].as_object()["summary_mysql_output"] = summary_output;
+            return false;
+        }
+        append_conversation_message_summary(item, summary);
         conversations.push_back(std::move(item));
     }
 
@@ -4079,6 +4364,353 @@ bool websocket_session::handle_message_send(const json::object& data,
     }
     response_code = protocol_code::OK;
     message = "message sent";
+    return true;
+}
+
+bool websocket_session::handle_message_pull(const json::object& data,
+                                            json::object& response_data,
+                                            std::string& message,
+                                            protocol_code& response_code)
+{
+    if (authenticated_user_id_ == 0ULL || authenticated_numeric_id_ == 0ULL) {
+        response_code = protocol_code::AUTH_REQUIRED;
+        message = "message pull requires authenticated session";
+        return false;
+    }
+
+    const std::string conversation_id = trim_copy(read_string_or_empty(data, "conversation_id"));
+    if (conversation_id.empty()) {
+        response_code = protocol_code::MESSAGE_INVALID;
+        message = "field 'data.conversation_id' is required";
+        return false;
+    }
+
+    unsigned long long after_seq = 0ULL;
+    bool has_after_seq = false;
+    unsigned long long requested_limit = k_message_pull_default_limit;
+    bool has_limit = false;
+    std::string parse_error;
+    if (!read_optional_unsigned_field(data, "after_seq", after_seq, has_after_seq, parse_error)
+        || !read_optional_unsigned_field(data, "limit", requested_limit, has_limit, parse_error)) {
+        response_code = protocol_code::MESSAGE_INVALID;
+        message = parse_error;
+        return false;
+    }
+    if (has_limit) {
+        if (requested_limit == 0ULL) {
+            response_code = protocol_code::MESSAGE_INVALID;
+            message = "field 'data.limit' must be greater than 0";
+            return false;
+        }
+        if (requested_limit > k_message_pull_max_limit) {
+            response_code = protocol_code::MESSAGE_INVALID;
+            message = "field 'data.limit' exceeds maximum 200";
+            return false;
+        }
+    } else {
+        requested_limit = k_message_pull_default_limit;
+    }
+
+    const mysql_config cfg = load_mysql_config();
+    response_data["debug"] = build_mysql_config_debug(cfg);
+    std::string config_error;
+    if (!is_mysql_config_valid(cfg, config_error)) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "message pull failed: database config missing";
+        response_data["debug"].as_object()["config_error"] = config_error;
+        return false;
+    }
+
+    unsigned long long internal_conversation_id = 0ULL;
+    unsigned long long conversation_type = 0ULL;
+    bool conversation_exists = false;
+    bool is_member = false;
+    std::string command_output;
+    int exit_code = 0;
+    if (!resolve_conversation_for_user(cfg,
+                                       conversation_id,
+                                       authenticated_user_id_,
+                                       internal_conversation_id,
+                                       conversation_type,
+                                       conversation_exists,
+                                       is_member,
+                                       command_output,
+                                       exit_code)) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "message pull failed in database";
+        response_data["debug"].as_object()["mysql_exit_code"] = exit_code;
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+    if (!conversation_exists) {
+        response_code = protocol_code::MESSAGE_NOT_FOUND;
+        message = "conversation not found";
+        response_data["conversation_id"] = conversation_id;
+        return false;
+    }
+    if (!is_member) {
+        response_code = protocol_code::PERMISSION_DENIED;
+        message = "requester is not a conversation member";
+        response_data["conversation_id"] = conversation_id;
+        return false;
+    }
+
+    std::ostringstream pull_sql;
+    pull_sql << "SELECT COALESCE(MAX(seq), 0) "
+             << "FROM messages "
+             << "WHERE conversation_id=" << internal_conversation_id
+             << " AND deleted_at IS NULL; "
+             << "SELECT "
+             << "m.message_uuid, "
+             << "m.seq, "
+             << "m.message_type, "
+             << "CAST(m.content AS CHAR), "
+             << "COALESCE(DATE_FORMAT(m.created_at, '%Y-%m-%dT%H:%i:%sZ'), ''), "
+             << "m.sender_user_id, "
+             << "COALESCE(u.numeric_id, 0), "
+             << "COALESCE(u.username, '') "
+             << "FROM messages m "
+             << "JOIN user_data u ON u.id=m.sender_user_id "
+             << "WHERE m.conversation_id=" << internal_conversation_id
+             << " AND m.deleted_at IS NULL "
+             << "AND m.seq>" << after_seq << " "
+             << "ORDER BY m.seq ASC, m.id ASC "
+             << "LIMIT " << (requested_limit + 1ULL) << ";";
+
+    command_output.clear();
+    exit_code = 0;
+    if (!run_mysql_sql(cfg, pull_sql.str(), command_output, exit_code)) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "message pull failed in database";
+        response_data["debug"].as_object()["mysql_exit_code"] = exit_code;
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    const std::vector<std::string> pull_lines = collect_non_empty_lines(command_output);
+    if (pull_lines.empty()) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "message pull failed: unexpected database output";
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    unsigned long long server_last_seq = 0ULL;
+    if (!parse_unsigned_long_long(trim_copy(pull_lines.front()), server_last_seq)) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "message pull failed: unexpected database output";
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    json::array messages;
+    unsigned long long next_after_seq = after_seq;
+    const std::size_t raw_message_count = (pull_lines.size() > 1U) ? (pull_lines.size() - 1U) : 0U;
+    const std::size_t returned_count = std::min<std::size_t>(raw_message_count,
+                                                             static_cast<std::size_t>(requested_limit));
+    const bool has_more = raw_message_count > returned_count;
+    for (std::size_t i = 0; i < returned_count; ++i) {
+        const std::vector<std::string> cols = split_by_tab(pull_lines[i + 1U]);
+        json::object item;
+        unsigned long long message_seq = 0ULL;
+        std::string build_error;
+        if (!build_pulled_message_item(conversation_id,
+                                       conversation_type,
+                                       cols,
+                                       item,
+                                       message_seq,
+                                       build_error)) {
+            response_code = protocol_code::INTERNAL_ERROR;
+            message = "message pull failed: malformed message row";
+            response_data["debug"].as_object()["row_error"] = build_error;
+            response_data["debug"].as_object()["mysql_output"] = command_output;
+            return false;
+        }
+        next_after_seq = message_seq;
+        messages.push_back(std::move(item));
+    }
+
+    response_data["conversation_id"] = conversation_id;
+    response_data["conversation_type"] = static_cast<std::uint64_t>(conversation_type);
+    response_data["after_seq"] = static_cast<std::uint64_t>(after_seq);
+    response_data["limit"] = static_cast<std::uint64_t>(requested_limit);
+    response_data["pulled_count"] = static_cast<std::uint64_t>(messages.size());
+    response_data["has_more"] = has_more;
+    response_data["next_after_seq"] = static_cast<std::uint64_t>(next_after_seq);
+    response_data["server_last_seq"] = static_cast<std::uint64_t>(server_last_seq);
+    response_data["messages"] = std::move(messages);
+    response_code = protocol_code::OK;
+    message = "message pull accepted";
+    return true;
+}
+
+bool websocket_session::handle_message_ack(const json::object& data,
+                                           json::object& response_data,
+                                           std::string& message,
+                                           protocol_code& response_code)
+{
+    if (authenticated_user_id_ == 0ULL || authenticated_numeric_id_ == 0ULL) {
+        response_code = protocol_code::AUTH_REQUIRED;
+        message = "message ack requires authenticated session";
+        return false;
+    }
+
+    const std::string conversation_id = trim_copy(read_string_or_empty(data, "conversation_id"));
+    if (conversation_id.empty()) {
+        response_code = protocol_code::MESSAGE_INVALID;
+        message = "field 'data.conversation_id' is required";
+        return false;
+    }
+
+    const auto delivered_it = data.find("delivered");
+    if (delivered_it == data.end() || !delivered_it->value().is_bool() || !delivered_it->value().as_bool()) {
+        response_code = protocol_code::MESSAGE_INVALID;
+        message = "field 'data.delivered' must be true";
+        return false;
+    }
+
+    unsigned long long up_to_seq = 0ULL;
+    bool has_up_to_seq = false;
+    std::string parse_error;
+    if (!read_optional_unsigned_field(data, "up_to_seq", up_to_seq, has_up_to_seq, parse_error)) {
+        response_code = protocol_code::MESSAGE_INVALID;
+        message = parse_error;
+        return false;
+    }
+
+    const std::string message_id = trim_copy(read_string_or_empty(data, "message_id"));
+    if (!has_up_to_seq && message_id.empty()) {
+        response_code = protocol_code::MESSAGE_INVALID;
+        message = "field 'data.up_to_seq' or 'data.message_id' is required";
+        return false;
+    }
+
+    const mysql_config cfg = load_mysql_config();
+    response_data["debug"] = build_mysql_config_debug(cfg);
+    std::string config_error;
+    if (!is_mysql_config_valid(cfg, config_error)) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "message ack failed: database config missing";
+        response_data["debug"].as_object()["config_error"] = config_error;
+        return false;
+    }
+
+    unsigned long long internal_conversation_id = 0ULL;
+    unsigned long long conversation_type = 0ULL;
+    bool conversation_exists = false;
+    bool is_member = false;
+    std::string command_output;
+    int exit_code = 0;
+    if (!resolve_conversation_for_user(cfg,
+                                       conversation_id,
+                                       authenticated_user_id_,
+                                       internal_conversation_id,
+                                       conversation_type,
+                                       conversation_exists,
+                                       is_member,
+                                       command_output,
+                                       exit_code)) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "message ack failed in database";
+        response_data["debug"].as_object()["mysql_exit_code"] = exit_code;
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+    if (!conversation_exists) {
+        response_code = protocol_code::MESSAGE_NOT_FOUND;
+        message = "conversation not found";
+        response_data["conversation_id"] = conversation_id;
+        return false;
+    }
+    if (!is_member) {
+        response_code = protocol_code::PERMISSION_DENIED;
+        message = "requester is not a conversation member";
+        response_data["conversation_id"] = conversation_id;
+        return false;
+    }
+
+    unsigned long long acked_up_to_seq = up_to_seq;
+    if (!has_up_to_seq) {
+        std::ostringstream lookup_sql;
+        lookup_sql << "SELECT seq "
+                   << "FROM messages "
+                   << "WHERE conversation_id=" << internal_conversation_id
+                   << " AND message_uuid='" << sql_escape(message_id) << "' "
+                   << "AND deleted_at IS NULL "
+                   << "LIMIT 1;";
+
+        command_output.clear();
+        exit_code = 0;
+        if (!run_mysql_sql(cfg, lookup_sql.str(), command_output, exit_code)) {
+            response_code = protocol_code::INTERNAL_ERROR;
+            message = "message ack failed in database";
+            response_data["debug"].as_object()["mysql_exit_code"] = exit_code;
+            response_data["debug"].as_object()["mysql_output"] = command_output;
+            return false;
+        }
+
+        const std::vector<std::string> lookup_lines = collect_non_empty_lines(command_output);
+        if (lookup_lines.empty()
+            || !parse_unsigned_long_long(trim_copy(lookup_lines.front()), acked_up_to_seq)
+            || acked_up_to_seq == 0ULL) {
+            response_code = protocol_code::MESSAGE_NOT_FOUND;
+            message = "message not found";
+            response_data["conversation_id"] = conversation_id;
+            response_data["message_id"] = message_id;
+            return false;
+        }
+    }
+
+    std::ostringstream ack_sql;
+    if (has_up_to_seq) {
+        ack_sql << "UPDATE message_receipts mr "
+                << "JOIN messages m ON m.id=mr.message_id "
+                << "SET mr.delivered_at=NOW() "
+                << "WHERE mr.user_id=" << authenticated_user_id_
+                << " AND m.conversation_id=" << internal_conversation_id
+                << " AND m.deleted_at IS NULL "
+                << "AND m.seq<=" << acked_up_to_seq
+                << " AND mr.delivered_at IS NULL; ";
+    } else {
+        ack_sql << "UPDATE message_receipts mr "
+                << "JOIN messages m ON m.id=mr.message_id "
+                << "SET mr.delivered_at=NOW() "
+                << "WHERE mr.user_id=" << authenticated_user_id_
+                << " AND m.conversation_id=" << internal_conversation_id
+                << " AND m.message_uuid='" << sql_escape(message_id) << "' "
+                << "AND m.deleted_at IS NULL "
+                << "AND mr.delivered_at IS NULL; ";
+    }
+    ack_sql << "SELECT ROW_COUNT();";
+
+    command_output.clear();
+    exit_code = 0;
+    if (!run_mysql_sql(cfg, ack_sql.str(), command_output, exit_code)) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "message ack failed in database";
+        response_data["debug"].as_object()["mysql_exit_code"] = exit_code;
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    unsigned long long affected_count = 0ULL;
+    const std::string affected_line = last_non_empty_line(command_output);
+    if (!affected_line.empty() && !parse_unsigned_long_long(trim_copy(affected_line), affected_count)) {
+        response_code = protocol_code::INTERNAL_ERROR;
+        message = "message ack failed: unexpected database output";
+        response_data["debug"].as_object()["mysql_output"] = command_output;
+        return false;
+    }
+
+    response_data["conversation_id"] = conversation_id;
+    response_data["conversation_type"] = static_cast<std::uint64_t>(conversation_type);
+    response_data["acked_up_to_seq"] = static_cast<std::uint64_t>(acked_up_to_seq);
+    response_data["affected_count"] = static_cast<std::uint64_t>(affected_count);
+    if (!message_id.empty()) {
+        response_data["message_id"] = message_id;
+    }
+    response_code = protocol_code::OK;
+    message = "message ack accepted";
     return true;
 }
 
@@ -4801,6 +5433,10 @@ void websocket_session::on_read(
             ok = handle_profile_delete_friend(request.data, response_data, message, response_code);
         } else if (request.type == "MESSAGE" && request.action == "SEND") {
             ok = handle_message_send(request.data, response_data, message, response_code);
+        } else if (request.type == "MESSAGE" && request.action == "PULL") {
+            ok = handle_message_pull(request.data, response_data, message, response_code);
+        } else if (request.type == "MESSAGE" && request.action == "ACK") {
+            ok = handle_message_ack(request.data, response_data, message, response_code);
         } else {
             ok = true;
             message = "request accepted";

@@ -37,6 +37,8 @@
 - `ADD_FRIEND`
 - `DELETE_FRIEND`
 - `LIST_FRIENDS`
+- `LIST_CONVERSATIONS`
+- `LIST_GROUPS`
 
 ### 2.3 MESSAGE
 - `SEND`
@@ -264,6 +266,34 @@
 }
 ```
 
+8. `action = LIST_CONVERSATIONS`
+```json
+{
+  "numeric_id": "string, 必填，无符号整数字符串"
+}
+```
+
+成功响应会返回：
+```json
+{
+  "numeric_id": "string",
+  "user_id": "string",
+  "conversations": [
+    {
+      "conversation_id": "string",
+      "conversation_uuid": "string",
+      "conversation_type": 1,
+      "name": "string",
+      "avatar_url": "string",
+      "updated_at": "UTC ISO8601",
+      "last_message_seq": 15,
+      "last_message_id": "string",
+      "last_message_sent_at": "UTC ISO8601"
+    }
+  ]
+}
+```
+
 ### 3.3 MESSAGE 的 data
 
 1. `action = SEND`
@@ -277,7 +307,38 @@
 2. `action = PULL`
 ```json
 {
-  "conversation_id": "string, 对应 conversations.conversation_uuid"
+  "conversation_id": "string, 对应 conversations.conversation_uuid",
+  "after_seq": "number/string, 可选，默认 0，仅返回 seq > after_seq 的消息",
+  "limit": "number/string, 可选，默认 100，最大 200"
+}
+```
+
+成功响应会返回：
+```json
+{
+  "conversation_id": "string",
+  "conversation_type": 1,
+  "after_seq": 0,
+  "limit": 100,
+  "pulled_count": 2,
+  "has_more": false,
+  "next_after_seq": 15,
+  "server_last_seq": 15,
+  "messages": [
+    {
+      "conversation_id": "string",
+      "message_id": "string",
+      "seq": 14,
+      "message_type": 1,
+      "message_kind": "text",
+      "conversation_type": 1,
+      "sent_at": "UTC ISO8601",
+      "from_user_id": "string",
+      "from_numeric_id": "string",
+      "from_username": "string",
+      "content": "string"
+    }
+  ]
 }
 ```
 
@@ -285,8 +346,19 @@
 ```json
 {
   "conversation_id": "string, 对应 conversations.conversation_uuid",
-  "message_id": "string",
+  "up_to_seq": "number/string, 可选，批量确认 seq <= up_to_seq",
+  "message_id": "string, 可选，兼容单条确认；未传 up_to_seq 时使用",
   "delivered": true
+}
+```
+
+成功响应会返回：
+```json
+{
+  "conversation_id": "string",
+  "conversation_type": 1,
+  "acked_up_to_seq": 15,
+  "affected_count": 2
 }
 ```
 
@@ -354,6 +426,9 @@
 - `AUTH/LOGOUT` 成功后会将当前连接对应用户置为离线；若连接异常关闭，服务端也会兜底离线
 - `PROFILE/LIST_FRIENDS` 会按 `data.numeric_id` 返回该用户的好友列表 `data.friends`，其中 `status/user_status` 为账号状态，`is_online/last_seen_at` 为在线状态
 - `PROFILE/LIST_FRIENDS` 会为每个好友补齐单聊会话标识：`conversation_uuid`，并同时返回兼容字段 `conversation_id`（两者值相同，均对应 `conversations.conversation_uuid`）
+- `PROFILE/LIST_CONVERSATIONS` 会返回会话级游标信息：`updated_at / last_message_seq / last_message_id / last_message_sent_at`
+- `MESSAGE/PULL` 会按会话内 `seq ASC` 拉取消息分页，返回 `has_more / next_after_seq / server_last_seq`
+- `MESSAGE/ACK` 支持按 `up_to_seq` 批量确认送达，也兼容旧的 `message_id` 单条确认
 - 当用户首次上线或最后一个在线连接离线时，服务端会主动向其所有在线好友广播 `MESSAGE/PRESENCE`
 - 请求失败：`code != 0`，`data.ok = false`，`data.message` 给出原因，可能附带 `data.received_payload`
 
