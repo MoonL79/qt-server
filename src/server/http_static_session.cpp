@@ -1,6 +1,9 @@
 #include "http_static_session.hpp"
+#include "dev_user_admin_page.hpp"
 #include "chat_file_store.hpp"
+#include "user_admin_service.hpp"
 #include <boost/core/ignore_unused.hpp>
+#include <boost/json.hpp>
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -11,6 +14,8 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
+#include <map>
 #include <sstream>
 #include <vector>
 #include <cerrno>
@@ -26,6 +31,8 @@
 
 namespace qt_server {
 namespace server {
+
+namespace json = boost::json;
 
 namespace {
 
@@ -256,6 +263,40 @@ std::string join_path(const std::string& lhs, const std::string& rhs)
     return lhs + "/" + rhs;
 }
 
+std::string trim_ascii_copy(const std::string& input)
+{
+    std::size_t begin = 0U;
+    std::size_t end = input.size();
+    while (begin < end && std::isspace(static_cast<unsigned char>(input[begin])) != 0) {
+        ++begin;
+    }
+    while (end > begin && std::isspace(static_cast<unsigned char>(input[end - 1U])) != 0) {
+        --end;
+    }
+    return input.substr(begin, end - begin);
+}
+
+std::string to_lower_ascii_copy(const std::string& input)
+{
+    std::string lowered = input;
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return lowered;
+}
+
+bool is_unsigned_integer_text_local(const std::string& value)
+{
+    if (value.empty()) {
+        return false;
+    }
+    for (char ch : value) {
+        if (std::isdigit(static_cast<unsigned char>(ch)) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 std::string read_header_line_value(const std::string& headers, const std::string& field_name)
 {
     const std::string marker = field_name + ":";
@@ -280,6 +321,285 @@ std::string read_header_line_value(const std::string& headers, const std::string
         return line.substr(marker.size());
     }
     return "";
+}
+
+bool decode_query_component(const std::string& input, std::string& decoded)
+{
+    std::string plus_normalized = input;
+    std::replace(plus_normalized.begin(), plus_normalized.end(), '+', ' ');
+    return decode_url_component(plus_normalized, decoded);
+}
+
+std::map<std::string, std::string> parse_query_params(const std::string& raw_query)
+{
+    std::map<std::string, std::string> params;
+    std::size_t begin = 0U;
+    while (begin <= raw_query.size()) {
+        const std::size_t amp = raw_query.find('&', begin);
+        const std::string pair = raw_query.substr(begin, amp == std::string::npos ? std::string::npos : (amp - begin));
+        const std::size_t equal = pair.find('=');
+        const std::string raw_key = pair.substr(0U, equal);
+        const std::string raw_value = (equal == std::string::npos) ? "" : pair.substr(equal + 1U);
+        std::string key;
+        std::string value;
+        if (decode_query_component(raw_key, key) && decode_query_component(raw_value, value) && !key.empty()) {
+            params[key] = value;
+        }
+        if (amp == std::string::npos) {
+            break;
+        }
+        begin = amp + 1U;
+    }
+    return params;
+}
+
+std::vector<std::string> split_path_segments(const std::string& path)
+{
+    std::vector<std::string> segments;
+    std::size_t begin = 0U;
+    while (begin < path.size()) {
+        while (begin < path.size() && path[begin] == '/') {
+            ++begin;
+        }
+        if (begin >= path.size()) {
+            break;
+        }
+        const std::size_t slash = path.find('/', begin);
+        if (slash == std::string::npos) {
+            segments.push_back(path.substr(begin));
+            break;
+        }
+        segments.push_back(path.substr(begin, slash - begin));
+        begin = slash + 1U;
+    }
+    return segments;
+}
+
+bool parse_bool_query(const std::map<std::string, std::string>& params,
+                      const std::string& key,
+                      bool fallback)
+{
+    const auto it = params.find(key);
+    if (it == params.end()) {
+        return fallback;
+    }
+    const std::string lowered = to_lower_ascii_copy(trim_ascii_copy(it->second));
+    if (lowered == "1" || lowered == "true" || lowered == "yes" || lowered == "on") {
+        return true;
+    }
+    if (lowered == "0" || lowered == "false" || lowered == "no" || lowered == "off") {
+        return false;
+    }
+    return fallback;
+}
+
+std::size_t parse_size_query(const std::map<std::string, std::string>& params,
+                             const std::string& key,
+                             std::size_t fallback)
+{
+    const auto it = params.find(key);
+    if (it == params.end()) {
+        return fallback;
+    }
+    const std::string trimmed = trim_ascii_copy(it->second);
+    if (trimmed.empty()) {
+        return fallback;
+    }
+    unsigned long long parsed = 0ULL;
+    if (!is_unsigned_integer_text_local(trimmed)) {
+        return fallback;
+    }
+    std::istringstream iss(trimmed);
+    iss >> parsed;
+    if (iss.fail()) {
+        return fallback;
+    }
+    return static_cast<std::size_t>(parsed);
+}
+
+bool read_json_object_body(const http::request<http::string_body>& request,
+                           json::object& out,
+                           std::string& error_message)
+{
+    error_message.clear();
+    if (request.body().empty()) {
+        error_message = "request body must be a JSON object";
+        return false;
+    }
+    json::error_code ec;
+    json::value parsed = json::parse(request.body(), ec);
+    if (ec || !parsed.is_object()) {
+        error_message = "request body must be a JSON object";
+        return false;
+    }
+    out = parsed.as_object();
+    return true;
+}
+
+bool try_get_header_value(const http::request<http::string_body>& request,
+                          const std::string& header_name,
+                          std::string& value)
+{
+    const std::string expected = to_lower_ascii_copy(header_name);
+    for (const auto& field : request) {
+        if (to_lower_ascii_copy(std::string(field.name_string())) == expected) {
+            value = std::string(field.value());
+            return true;
+        }
+    }
+    value.clear();
+    return false;
+}
+
+std::string read_json_string(const json::object& obj, const char* field)
+{
+    const auto it = obj.find(field);
+    if (it == obj.end() || !it->value().is_string()) {
+        return "";
+    }
+    return std::string(it->value().as_string().c_str());
+}
+
+bool read_required_json_string(const json::object& obj,
+                               const char* field,
+                               std::string& value,
+                               std::string& error_message)
+{
+    const auto it = obj.find(field);
+    if (it == obj.end() || !it->value().is_string()) {
+        error_message = std::string("field '") + field + "' must be a string";
+        return false;
+    }
+    value = std::string(it->value().as_string().c_str());
+    return true;
+}
+
+bool read_optional_json_string(const json::object& obj,
+                               const char* field,
+                               bool& present,
+                               std::string& value,
+                               std::string& error_message)
+{
+    const auto it = obj.find(field);
+    if (it == obj.end()) {
+        present = false;
+        value.clear();
+        return true;
+    }
+    if (!it->value().is_string()) {
+        error_message = std::string("field '") + field + "' must be a string";
+        return false;
+    }
+    present = true;
+    value = std::string(it->value().as_string().c_str());
+    return true;
+}
+
+bool read_required_json_uint(const json::object& obj,
+                             const char* field,
+                             unsigned int& value,
+                             std::string& error_message)
+{
+    const auto it = obj.find(field);
+    if (it == obj.end()) {
+        error_message = std::string("field '") + field + "' is required";
+        return false;
+    }
+    if (it->value().is_int64()) {
+        const std::int64_t parsed = it->value().as_int64();
+        if (parsed < 0 || static_cast<std::uint64_t>(parsed) > static_cast<std::uint64_t>(std::numeric_limits<unsigned int>::max())) {
+            error_message = std::string("field '") + field + "' must be a non-negative integer";
+            return false;
+        }
+        value = static_cast<unsigned int>(parsed);
+        return true;
+    }
+    if (it->value().is_uint64()) {
+        const std::uint64_t parsed = it->value().as_uint64();
+        if (parsed > static_cast<std::uint64_t>(std::numeric_limits<unsigned int>::max())) {
+            error_message = std::string("field '") + field + "' is out of range";
+            return false;
+        }
+        value = static_cast<unsigned int>(parsed);
+        return true;
+    }
+    if (it->value().is_string()) {
+        const std::string text = trim_ascii_copy(std::string(it->value().as_string().c_str()));
+        if (!is_unsigned_integer_text_local(text)) {
+            error_message = std::string("field '") + field + "' must be a non-negative integer";
+            return false;
+        }
+        unsigned long long parsed = 0ULL;
+        std::istringstream iss(text);
+        iss >> parsed;
+        if (iss.fail() || parsed > static_cast<unsigned long long>(std::numeric_limits<unsigned int>::max())) {
+            error_message = std::string("field '") + field + "' must be a non-negative integer";
+            return false;
+        }
+        value = static_cast<unsigned int>(parsed);
+        return true;
+    }
+    error_message = std::string("field '") + field + "' must be a non-negative integer";
+    return false;
+}
+
+bool read_optional_json_uint(const json::object& obj,
+                             const char* field,
+                             bool& present,
+                             unsigned int& value,
+                             std::string& error_message)
+{
+    const auto it = obj.find(field);
+    if (it == obj.end()) {
+        present = false;
+        value = 0U;
+        return true;
+    }
+    present = true;
+    json::object wrapper;
+    wrapper[field] = it->value();
+    return read_required_json_uint(wrapper, field, value, error_message);
+}
+
+http::status to_http_status(user_admin_error_code code)
+{
+    switch (code) {
+    case user_admin_error_code::unauthorized:
+        return http::status::unauthorized;
+    case user_admin_error_code::validation:
+        return http::status::bad_request;
+    case user_admin_error_code::conflict:
+        return http::status::conflict;
+    case user_admin_error_code::not_found:
+        return http::status::not_found;
+    case user_admin_error_code::config:
+    case user_admin_error_code::database:
+        return http::status::internal_server_error;
+    case user_admin_error_code::none:
+    default:
+        return http::status::bad_request;
+    }
+}
+
+json::object managed_user_to_json(const managed_user_record& user)
+{
+    json::object item;
+    item["user_id"] = std::to_string(user.user_id);
+    item["numeric_id"] = std::to_string(user.numeric_id);
+    item["user_uuid"] = user.user_uuid;
+    item["username"] = user.username;
+    item["email"] = user.email;
+    item["phone"] = user.phone;
+    item["status"] = static_cast<int>(user.status);
+    item["nickname"] = user.nickname;
+    item["avatar_url"] = user.avatar_url;
+    item["bio"] = user.bio;
+    item["is_online"] = user.is_online;
+    item["last_seen_at"] = user.last_seen_at;
+    item["last_login_at"] = user.last_login_at;
+    item["created_at"] = user.created_at;
+    item["updated_at"] = user.updated_at;
+    return item;
 }
 
 } // namespace
@@ -329,17 +649,25 @@ void http_static_session::on_read(beast::error_code ec, std::size_t bytes_transf
     handle_request();
 }
 
-void http_static_session::send_json_payload(http::status status, const std::string& body)
+void http_static_session::send_string_payload(http::status status,
+                                              const std::string& content_type,
+                                              const std::string& cache_control,
+                                              const std::string& body)
 {
     http::response<http::string_body> response{status, request_.version()};
     response.set(http::field::server, BOOST_BEAST_VERSION_STRING);
-    response.set(http::field::content_type, "application/json; charset=utf-8");
-    response.set(http::field::cache_control, "no-store");
+    response.set(http::field::content_type, content_type);
+    response.set(http::field::cache_control, cache_control);
     response.set("X-Content-Type-Options", "nosniff");
     response.keep_alive(false);
     response.body() = body;
     response.prepare_payload();
     send_response(std::move(response));
+}
+
+void http_static_session::send_json_payload(http::status status, const std::string& body)
+{
+    send_string_payload(status, "application/json; charset=utf-8", "no-store", body);
 }
 
 void http_static_session::send_json_response(http::status status,
@@ -358,6 +686,230 @@ void http_static_session::send_json_response(http::status status,
     send_json_payload(status, oss.str());
 }
 
+void http_static_session::handle_dev_admin_page()
+{
+    if (request_.method() != http::verb::get) {
+        json::object response;
+        response["ok"] = false;
+        response["message"] = "method not allowed";
+        send_json_payload(http::status::method_not_allowed, json::serialize(response));
+        return;
+    }
+    send_string_payload(http::status::ok,
+                        "text/html; charset=utf-8",
+                        "no-store",
+                        build_dev_user_admin_page());
+}
+
+void http_static_session::handle_dev_admin_api(const std::string& clean_target)
+{
+    const auto send_api_error = [this](http::status status,
+                                       const std::string& message,
+                                       const std::string& debug = std::string()) {
+        json::object response;
+        response["ok"] = false;
+        response["message"] = message;
+        if (!debug.empty()) {
+            response["debug"] = debug;
+        }
+        send_json_payload(status, json::serialize(response));
+    };
+
+    const auto send_api_method_not_allowed = [this]() {
+        json::object response;
+        response["ok"] = false;
+        response["message"] = "method not allowed";
+        send_json_payload(http::status::method_not_allowed, json::serialize(response));
+    };
+
+    std::string raw_admin_token;
+    if (!try_get_header_value(request_, "X-Dev-Admin-Token", raw_admin_token)) {
+        send_api_error(http::status::unauthorized, "missing or invalid developer admin token");
+        return;
+    }
+    const std::string admin_token = trim_copy(raw_admin_token);
+    if (!is_dev_admin_token_valid(admin_token)) {
+        send_api_error(http::status::unauthorized, "missing or invalid developer admin token");
+        return;
+    }
+
+    const std::vector<std::string> segments = split_path_segments(clean_target);
+    if (segments.size() < 3U || segments[0] != "admin" || segments[1] != "api" || segments[2] != "users") {
+        send_api_error(http::status::not_found, "resource not found");
+        return;
+    }
+
+    const std::string request_target = std::string(request_.target());
+    const std::size_t query_pos = request_target.find('?');
+    const std::map<std::string, std::string> query_params = (query_pos == std::string::npos)
+        ? std::map<std::string, std::string>()
+        : parse_query_params(request_target.substr(query_pos + 1U));
+
+    if (segments.size() == 3U) {
+        if (request_.method() == http::verb::get) {
+            user_list_options options;
+            const auto keyword_it = query_params.find("keyword");
+            if (keyword_it != query_params.end()) {
+                options.keyword = keyword_it->second;
+            }
+            options.limit = parse_size_query(query_params, "limit", 100U);
+            options.include_disabled = parse_bool_query(query_params, "include_disabled", true);
+
+            std::vector<managed_user_record> users;
+            user_admin_error error;
+            if (!list_managed_users(options, users, error)) {
+                send_api_error(to_http_status(error.code), error.message, error.debug);
+                return;
+            }
+
+            json::array items;
+            for (const managed_user_record& user : users) {
+                items.push_back(managed_user_to_json(user));
+            }
+
+            json::object response;
+            response["ok"] = true;
+            response["message"] = "users loaded";
+            response["count"] = static_cast<std::uint64_t>(users.size());
+            response["users"] = std::move(items);
+            send_json_payload(http::status::ok, json::serialize(response));
+            return;
+        }
+
+        if (request_.method() == http::verb::post) {
+            json::object body;
+            std::string parse_error;
+            if (!read_json_object_body(request_, body, parse_error)) {
+                send_api_error(http::status::bad_request, parse_error);
+                return;
+            }
+
+            create_user_request create_request;
+            if (!read_required_json_string(body, "username", create_request.username, parse_error)
+                || !read_required_json_string(body, "email", create_request.email, parse_error)
+                || !read_required_json_string(body, "password", create_request.password, parse_error)
+                || !read_required_json_string(body, "nickname", create_request.nickname, parse_error)) {
+                send_api_error(http::status::bad_request, parse_error);
+                return;
+            }
+            create_request.phone = read_json_string(body, "phone");
+            create_request.avatar_url = read_json_string(body, "avatar_url");
+            create_request.bio = read_json_string(body, "bio");
+            unsigned int status = 1U;
+            bool status_present = false;
+            if (!read_optional_json_uint(body, "status", status_present, status, parse_error)) {
+                send_api_error(http::status::bad_request, parse_error);
+                return;
+            }
+            if (status_present) {
+                create_request.status = status;
+            }
+
+            managed_user_record created_user;
+            user_admin_error error;
+            if (!create_managed_user(create_request, created_user, error)) {
+                send_api_error(to_http_status(error.code), error.message, error.debug);
+                return;
+            }
+
+            json::object response;
+            response["ok"] = true;
+            response["message"] = "user created";
+            response["user"] = managed_user_to_json(created_user);
+            send_json_payload(http::status::ok, json::serialize(response));
+            return;
+        }
+
+        send_api_method_not_allowed();
+        return;
+    }
+
+    if (!is_unsigned_integer_text_local(segments[3])) {
+        send_api_error(http::status::bad_request, "user_id must be an unsigned integer");
+        return;
+    }
+    unsigned long long user_id = std::strtoull(segments[3].c_str(), nullptr, 10);
+    if (user_id == 0ULL) {
+        send_api_error(http::status::bad_request, "user_id must be an unsigned integer");
+        return;
+    }
+
+    if (segments.size() == 4U) {
+        if (request_.method() != http::verb::patch) {
+            send_api_method_not_allowed();
+            return;
+        }
+
+        json::object body;
+        std::string parse_error;
+        if (!read_json_object_body(request_, body, parse_error)) {
+            send_api_error(http::status::bad_request, parse_error);
+            return;
+        }
+
+        update_user_request update_request;
+        update_request.user_id = user_id;
+        if (!read_optional_json_string(body, "email", update_request.has_email, update_request.email, parse_error)
+            || !read_optional_json_string(body, "phone", update_request.has_phone, update_request.phone, parse_error)
+            || !read_optional_json_string(body, "nickname", update_request.has_nickname, update_request.nickname, parse_error)
+            || !read_optional_json_string(body, "avatar_url", update_request.has_avatar_url, update_request.avatar_url, parse_error)
+            || !read_optional_json_string(body, "bio", update_request.has_bio, update_request.bio, parse_error)
+            || !read_optional_json_uint(body, "status", update_request.has_status, update_request.status, parse_error)) {
+            send_api_error(http::status::bad_request, parse_error);
+            return;
+        }
+
+        managed_user_record updated_user;
+        user_admin_error error;
+        if (!update_managed_user(update_request, updated_user, error)) {
+            send_api_error(to_http_status(error.code), error.message, error.debug);
+            return;
+        }
+
+        json::object response;
+        response["ok"] = true;
+        response["message"] = "user updated";
+        response["user"] = managed_user_to_json(updated_user);
+        send_json_payload(http::status::ok, json::serialize(response));
+        return;
+    }
+
+    if (segments.size() == 5U && segments[4] == "reset-password") {
+        if (request_.method() != http::verb::post) {
+            send_api_method_not_allowed();
+            return;
+        }
+
+        json::object body;
+        std::string parse_error;
+        if (!read_json_object_body(request_, body, parse_error)) {
+            send_api_error(http::status::bad_request, parse_error);
+            return;
+        }
+
+        std::string new_password;
+        if (!read_required_json_string(body, "password", new_password, parse_error)) {
+            send_api_error(http::status::bad_request, parse_error);
+            return;
+        }
+
+        user_admin_error error;
+        if (!reset_managed_user_password(user_id, new_password, error)) {
+            send_api_error(to_http_status(error.code), error.message, error.debug);
+            return;
+        }
+
+        json::object response;
+        response["ok"] = true;
+        response["message"] = "password reset";
+        response["user_id"] = std::to_string(user_id);
+        send_json_payload(http::status::ok, json::serialize(response));
+        return;
+    }
+
+    send_api_error(http::status::not_found, "resource not found");
+}
+
 void http_static_session::handle_request()
 {
     if (request_.method() == http::verb::post && request_.target() == "/upload/avatar") {
@@ -369,6 +921,16 @@ void http_static_session::handle_request()
         return;
     }
     const std::string request_target = std::string(request_.target());
+    const std::size_t query_pos = request_target.find('?');
+    const std::string clean_target = request_target.substr(0U, query_pos);
+    if (clean_target == "/admin/users") {
+        handle_dev_admin_page();
+        return;
+    }
+    if (clean_target.rfind("/admin/api/users", 0U) == 0U) {
+        handle_dev_admin_api(clean_target);
+        return;
+    }
     static const std::string chat_download_prefix = "/download/chat-file/";
     if ((request_.method() == http::verb::get || request_.method() == http::verb::head)
         && request_target.rfind(chat_download_prefix, 0U) == 0U
@@ -437,8 +999,6 @@ void http_static_session::handle_request()
         return;
     }
 
-    const std::size_t query_pos = target.find('?');
-    const std::string clean_target = target.substr(0U, query_pos);
     static const std::string prefix = "/static/";
     if (clean_target.rfind(prefix, 0U) != 0U) {
         not_found();

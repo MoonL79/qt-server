@@ -1,0 +1,14 @@
+#ifndef DEV_USER_ADMIN_PAGE_HPP
+#define DEV_USER_ADMIN_PAGE_HPP
+
+#include <string>
+
+namespace qt_server {
+namespace server {
+
+std::string build_dev_user_admin_page();
+
+} // namespace server
+} // namespace qt_server
+
+#endif // DEV_USER_ADMIN_PAGE_HPP

@@ -17,7 +17,9 @@ find_package(Threads REQUIRED)
 
 add_executable (qt-server
     "src/main.cpp"
+    "src/server/dev_user_admin_page.cpp"
     "src/server/chat_file_store.cpp"
+    "src/server/user_admin_service.cpp"
     "src/server/echo_server.cpp"
     "src/server/http_static_server.cpp"
     "src/server/http_static_session.cpp"

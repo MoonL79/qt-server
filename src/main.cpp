@@ -100,6 +100,7 @@ int main(int argc, char* argv[])
     set_env_if_absent("QT_SERVER_STATIC_ROOT", default_static_root.c_str());
     set_env_if_absent("QT_SERVER_STATIC_PUBLIC_HOST", "127.0.0.1");
     set_env_if_absent("QT_SERVER_STATIC_PUBLIC_SCHEME", "http");
+    set_env_if_absent("QT_SERVER_DEV_ADMIN_TOKEN", "dev-admin-123456");
 
     // 设置信号处理
     std::signal(SIGINT, signal_handler);
@@ -132,6 +133,8 @@ int main(int argc, char* argv[])
               << ", root=" << static_root << std::endl;
     std::cout << "HTTP public endpoint: " << public_scheme << "://" << public_host
               << ":" << static_port << std::endl;
+    std::cout << "Developer admin page: " << public_scheme << "://" << public_host
+              << ":" << static_port << "/admin/users" << std::endl;
 
     // 创建echo服务器实例
     qt_server::server::echo_server server(port,
