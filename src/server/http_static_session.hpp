@@ -46,9 +46,15 @@ private:
     void do_read();
     void on_read(beast::error_code ec, std::size_t bytes_transferred);
     void handle_dev_admin_login_page();
-    void handle_dev_admin_page();
+    void handle_dev_admin_page(const std::string& clean_target);
     void handle_dev_admin_session_api(const std::string& clean_target);
+    void handle_dev_admin_overview_api();
     void handle_dev_admin_api(const std::string& clean_target);
+    void handle_dev_admin_groups_api(const std::string& clean_target);
+    void handle_dev_admin_conversations_api(const std::string& clean_target);
+    void handle_dev_admin_sessions_api(const std::string& clean_target);
+    void handle_dev_admin_files_api(const std::string& clean_target);
+    void handle_dev_admin_chat_file_download_api(const std::string& file_id);
 
     template <class Body, class Fields>
     void send_response(http::response<Body, Fields>&& response)

@@ -2,6 +2,7 @@
 #include "dev_user_admin_page.hpp"
 #include "chat_file_store.hpp"
 #include "user_admin_service.hpp"
+#include "websocket_session.hpp"
 #include <boost/core/ignore_unused.hpp>
 #include <boost/json.hpp>
 #include <algorithm>
@@ -22,6 +23,7 @@
 
 #if defined(_WIN32)
 #include <direct.h>
+#include <sys/stat.h>
 #define QT_SERVER_MKDIR(path) _mkdir(path)
 #else
 #include <sys/stat.h>
@@ -417,6 +419,131 @@ std::size_t parse_size_query(const std::map<std::string, std::string>& params,
     return static_cast<std::size_t>(parsed);
 }
 
+unsigned long long parse_unsigned_long_long_query(const std::map<std::string, std::string>& params,
+                                                  const std::string& key,
+                                                  unsigned long long fallback)
+{
+    const auto it = params.find(key);
+    if (it == params.end()) {
+        return fallback;
+    }
+    const std::string trimmed = trim_ascii_copy(it->second);
+    if (!is_unsigned_integer_text_local(trimmed)) {
+        return fallback;
+    }
+    unsigned long long parsed = fallback;
+    std::istringstream iss(trimmed);
+    iss >> parsed;
+    return iss.fail() ? fallback : parsed;
+}
+
+std::string format_utc_timestamp(std::time_t value)
+{
+    if (value <= 0) {
+        return "";
+    }
+
+    std::tm tm_value;
+#if defined(_WIN32)
+    if (gmtime_s(&tm_value, &value) != 0) {
+        return "";
+    }
+#else
+    if (gmtime_r(&value, &tm_value) == nullptr) {
+        return "";
+    }
+#endif
+
+    char buffer[32];
+    if (std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &tm_value) == 0U) {
+        return "";
+    }
+    return buffer;
+}
+
+struct local_file_probe
+{
+    bool exists = false;
+    std::uint64_t size_bytes = 0ULL;
+    std::string modified_at;
+};
+
+local_file_probe probe_local_file(const std::string& path)
+{
+    local_file_probe probe;
+    if (path.empty()) {
+        return probe;
+    }
+
+#if defined(_WIN32)
+    struct _stat64 info;
+    if (_stat64(path.c_str(), &info) != 0) {
+        return probe;
+    }
+#else
+    struct stat info;
+    if (stat(path.c_str(), &info) != 0) {
+        return probe;
+    }
+#endif
+
+    probe.exists = true;
+    probe.size_bytes = static_cast<std::uint64_t>(info.st_size);
+    probe.modified_at = format_utc_timestamp(info.st_mtime);
+    return probe;
+}
+
+bool resolve_static_relative_path(const std::string& static_root,
+                                  const std::string& raw_relative,
+                                  std::string& safe_relative,
+                                  std::string& absolute_path)
+{
+    safe_relative.clear();
+    absolute_path.clear();
+    if (static_root.empty()) {
+        return false;
+    }
+    if (!build_safe_relative_path(raw_relative, safe_relative)) {
+        return false;
+    }
+    absolute_path = join_path(static_root, safe_relative);
+    return !absolute_path.empty();
+}
+
+struct avatar_asset_probe
+{
+    bool exists = false;
+    std::string filename;
+    std::uint64_t size_bytes = 0ULL;
+    std::string modified_at;
+};
+
+avatar_asset_probe probe_avatar_asset(const std::string& static_root,
+                                      unsigned long long user_id)
+{
+    avatar_asset_probe probe;
+    if (static_root.empty() || user_id == 0ULL) {
+        return probe;
+    }
+
+    static const std::array<const char*, 5U> k_extensions = {{"jpg", "jpeg", "png", "webp", "gif"}};
+    const std::string avatar_dir = join_path(static_root, "avatar");
+    const std::string user_id_text = std::to_string(user_id);
+    for (const char* extension : k_extensions) {
+        const std::string filename = user_id_text + "." + extension;
+        const local_file_probe file = probe_local_file(join_path(avatar_dir, filename));
+        if (!file.exists) {
+            continue;
+        }
+        probe.exists = true;
+        probe.filename = filename;
+        probe.size_bytes = file.size_bytes;
+        probe.modified_at = file.modified_at;
+        return probe;
+    }
+    return probe;
+}
+
 bool read_json_object_body(const http::request<http::string_body>& request,
                            json::object& out,
                            std::string& error_message)
@@ -491,6 +618,20 @@ bool read_cookie_value(const http::request<http::string_body>& request,
     }
     value = it->second;
     return !value.empty();
+}
+
+bool validate_admin_cookie_session(const http::request<http::string_body>& request,
+                                   admin_user_account& admin,
+                                   user_admin_error& error)
+{
+    std::string session_token;
+    if (!read_cookie_value(request, admin_session_cookie_name(), session_token)) {
+        error = user_admin_error{};
+        error.code = user_admin_error_code::unauthorized;
+        error.message = "missing admin session";
+        return false;
+    }
+    return validate_admin_session(session_token, admin, error);
 }
 
 std::string build_admin_session_set_cookie(const std::string& session_token)
@@ -661,6 +802,23 @@ json::object managed_user_to_json(const managed_user_record& user)
     return item;
 }
 
+json::object admin_overview_to_json(const admin_overview_summary& summary)
+{
+    json::object item;
+    item["total_users"] = static_cast<std::uint64_t>(summary.total_users);
+    item["enabled_users"] = static_cast<std::uint64_t>(summary.enabled_users);
+    item["disabled_users"] = static_cast<std::uint64_t>(summary.disabled_users);
+    item["online_users"] = static_cast<std::uint64_t>(summary.online_users);
+    item["recent_login_users"] = static_cast<std::uint64_t>(summary.recent_login_users);
+    item["recent_seen_users"] = static_cast<std::uint64_t>(summary.recent_seen_users);
+    json::array recent_users;
+    for (const managed_user_record& user : summary.recent_users) {
+        recent_users.push_back(managed_user_to_json(user));
+    }
+    item["recent_users"] = std::move(recent_users);
+    return item;
+}
+
 json::object admin_user_to_json(const admin_user_account& admin)
 {
     json::object item;
@@ -671,6 +829,137 @@ json::object admin_user_to_json(const admin_user_account& admin)
     item["last_login_at"] = admin.last_login_at;
     item["created_at"] = admin.created_at;
     item["updated_at"] = admin.updated_at;
+    return item;
+}
+
+json::object admin_group_to_json(const admin_group_record& group)
+{
+    json::object item;
+    item["conversation_id"] = group.conversation_id;
+    item["group_numeric_id"] = std::to_string(group.group_numeric_id);
+    item["name"] = group.name;
+    item["avatar_url"] = group.avatar_url;
+    item["notice"] = group.notice;
+    item["owner_user_id"] = std::to_string(group.owner_user_id);
+    item["owner_numeric_id"] = std::to_string(group.owner_numeric_id);
+    item["owner_username"] = group.owner_username;
+    item["owner_nickname"] = group.owner_nickname;
+    item["member_count"] = static_cast<std::uint64_t>(group.member_count);
+    item["created_at"] = group.created_at;
+    item["updated_at"] = group.updated_at;
+    item["last_message_seq"] = group.last_message_seq;
+    item["last_message_id"] = group.last_message_id;
+    item["last_message_sent_at"] = group.last_message_sent_at;
+    return item;
+}
+
+json::object admin_group_member_to_json(const admin_group_member_record& member)
+{
+    json::object item;
+    item["user_id"] = std::to_string(member.user_id);
+    item["numeric_id"] = std::to_string(member.numeric_id);
+    item["username"] = member.username;
+    item["nickname"] = member.nickname;
+    item["avatar_url"] = member.avatar_url;
+    item["status"] = static_cast<int>(member.status);
+    item["is_online"] = member.is_online;
+    item["last_seen_at"] = member.last_seen_at;
+    item["role"] = static_cast<int>(member.role);
+    item["mute_until"] = member.mute_until;
+    return item;
+}
+
+json::object admin_conversation_to_json(const admin_conversation_record& conversation)
+{
+    json::object item;
+    item["conversation_id"] = conversation.conversation_id;
+    item["conversation_type"] = static_cast<int>(conversation.conversation_type);
+    item["group_numeric_id"] = std::to_string(conversation.group_numeric_id);
+    item["name"] = conversation.name;
+    item["avatar_url"] = conversation.avatar_url;
+    item["notice"] = conversation.notice;
+    item["owner_user_id"] = std::to_string(conversation.owner_user_id);
+    item["member_count"] = static_cast<std::uint64_t>(conversation.member_count);
+    item["created_at"] = conversation.created_at;
+    item["updated_at"] = conversation.updated_at;
+    item["last_message_seq"] = conversation.last_message_seq;
+    item["last_message_id"] = conversation.last_message_id;
+    item["last_message_sent_at"] = conversation.last_message_sent_at;
+    item["participants_summary"] = conversation.participants_summary;
+    return item;
+}
+
+json::object admin_message_to_json(const admin_message_record& message)
+{
+    json::object item;
+    item["conversation_id"] = message.conversation_id;
+    item["message_id"] = message.message_id;
+    item["seq"] = message.seq;
+    item["message_type"] = message.message_type;
+    item["message_kind"] = message.message_kind;
+    item["content_preview"] = message.content_preview;
+    item["content_json"] = message.content_json;
+    item["file_id"] = message.file_id;
+    item["file_name"] = message.file_name;
+    item["file_size_bytes"] = message.file_size_bytes;
+    item["sent_at"] = message.sent_at;
+    item["sender_user_id"] = std::to_string(message.sender_user_id);
+    item["sender_numeric_id"] = std::to_string(message.sender_numeric_id);
+    item["sender_username"] = message.sender_username;
+    item["receipt_total"] = static_cast<std::uint64_t>(message.receipt_total);
+    item["delivered_count"] = static_cast<std::uint64_t>(message.delivered_count);
+    item["pending_count"] = static_cast<std::uint64_t>(message.pending_count);
+    return item;
+}
+
+json::object admin_message_receipt_to_json(const admin_message_receipt_record& receipt)
+{
+    json::object item;
+    item["user_id"] = std::to_string(receipt.user_id);
+    item["numeric_id"] = std::to_string(receipt.numeric_id);
+    item["username"] = receipt.username;
+    item["nickname"] = receipt.nickname;
+    item["delivered"] = receipt.delivered;
+    item["delivered_at"] = receipt.delivered_at;
+    return item;
+}
+
+json::object admin_chat_file_to_json(const admin_chat_file_record& file)
+{
+    json::object item;
+    item["file_id"] = file.file_id;
+    item["conversation_id"] = file.conversation_id;
+    item["uploader_user_id"] = std::to_string(file.uploader_user_id);
+    item["uploader_numeric_id"] = std::to_string(file.uploader_numeric_id);
+    item["uploader_username"] = file.uploader_username;
+    item["uploader_nickname"] = file.uploader_nickname;
+    item["original_name"] = file.original_name;
+    item["stored_name"] = file.stored_name;
+    item["stored_relative_path"] = file.stored_relative_path;
+    item["content_type"] = file.content_type;
+    item["sha256"] = file.sha256;
+    item["size_bytes"] = static_cast<std::uint64_t>(file.size_bytes);
+    item["attached"] = file.attached;
+    item["bound_message_id"] = file.bound_message_id;
+    item["created_at"] = file.created_at;
+    item["attached_at"] = file.attached_at;
+    return item;
+}
+
+json::object websocket_connection_to_json(const websocket_admin_connection_snapshot& snapshot)
+{
+    json::object item;
+    item["remote_endpoint"] = snapshot.remote_endpoint;
+    item["authenticated_username"] = snapshot.authenticated_username;
+    item["connected_at"] = snapshot.connected_at;
+    item["last_read_at"] = snapshot.last_read_at;
+    item["last_write_at"] = snapshot.last_write_at;
+    item["last_activity_at"] = snapshot.last_activity_at;
+    item["state"] = snapshot.state;
+    item["authenticated_user_id"] = std::to_string(snapshot.authenticated_user_id);
+    item["authenticated_numeric_id"] = std::to_string(snapshot.authenticated_numeric_id);
+    item["pending_writes"] = static_cast<std::uint64_t>(snapshot.pending_writes);
+    item["write_in_progress"] = snapshot.write_in_progress;
     return item;
 }
 
@@ -790,7 +1079,7 @@ void http_static_session::handle_dev_admin_login_page()
     user_admin_error error;
     if (read_cookie_value(request_, admin_session_cookie_name(), session_token)
         && validate_admin_session(session_token, admin, error)) {
-        send_redirect_response("/admin/users");
+        send_redirect_response("/admin/overview");
         return;
     }
 
@@ -800,7 +1089,7 @@ void http_static_session::handle_dev_admin_login_page()
                         build_dev_admin_login_page());
 }
 
-void http_static_session::handle_dev_admin_page()
+void http_static_session::handle_dev_admin_page(const std::string& clean_target)
 {
     if (request_.method() != http::verb::get) {
         json::object response;
@@ -820,10 +1109,31 @@ void http_static_session::handle_dev_admin_page()
         return;
     }
 
+    std::string body;
+    if (clean_target == "/admin/overview") {
+        body = build_dev_admin_overview_page();
+    } else if (clean_target == "/admin/users") {
+        body = build_dev_user_admin_page();
+    } else if (clean_target == "/admin/groups") {
+        body = build_dev_admin_groups_page();
+    } else if (clean_target == "/admin/conversations") {
+        body = build_dev_admin_conversations_page();
+    } else if (clean_target == "/admin/sessions") {
+        body = build_dev_admin_sessions_page();
+    } else if (clean_target == "/admin/files") {
+        body = build_dev_admin_files_page();
+    } else {
+        json::object response;
+        response["ok"] = false;
+        response["message"] = "resource not found";
+        send_json_payload(http::status::not_found, json::serialize(response));
+        return;
+    }
+
     send_string_payload(http::status::ok,
                         "text/html; charset=utf-8",
                         "no-store",
-                        build_dev_user_admin_page());
+                        body);
 }
 
 void http_static_session::handle_dev_admin_session_api(const std::string& clean_target)
@@ -889,7 +1199,7 @@ void http_static_session::handle_dev_admin_session_api(const std::string& clean_
         json::object response;
         response["ok"] = true;
         response["message"] = "admin login accepted";
-        response["redirect_to"] = "/admin/users";
+        response["redirect_to"] = "/admin/overview";
         response["session_ttl_seconds"] = result.session_ttl_seconds;
         response["admin"] = admin_user_to_json(result.admin);
         send_api_json(http::status::ok,
@@ -942,6 +1252,51 @@ void http_static_session::handle_dev_admin_session_api(const std::string& clean_
     }
 
     send_api_error(http::status::not_found, "resource not found");
+}
+
+void http_static_session::handle_dev_admin_overview_api()
+{
+    if (request_.method() != http::verb::get) {
+        json::object response;
+        response["ok"] = false;
+        response["message"] = "method not allowed";
+        send_json_payload(http::status::method_not_allowed, json::serialize(response));
+        return;
+    }
+
+    std::string session_token;
+    admin_user_account admin;
+    user_admin_error admin_error;
+    if (!read_cookie_value(request_, admin_session_cookie_name(), session_token)
+        || !validate_admin_session(session_token, admin, admin_error)) {
+        json::object response;
+        response["ok"] = false;
+        response["message"] = admin_error.message.empty() ? "missing admin session" : admin_error.message;
+        if (!admin_error.debug.empty()) {
+            response["debug"] = admin_error.debug;
+        }
+        send_json_payload(http::status::unauthorized, json::serialize(response));
+        return;
+    }
+
+    admin_overview_summary summary;
+    user_admin_error error;
+    if (!load_admin_overview(summary, error)) {
+        json::object response;
+        response["ok"] = false;
+        response["message"] = error.message;
+        if (!error.debug.empty()) {
+            response["debug"] = error.debug;
+        }
+        send_json_payload(to_http_status(error.code), json::serialize(response));
+        return;
+    }
+
+    json::object response;
+    response["ok"] = true;
+    response["message"] = "overview loaded";
+    response["overview"] = admin_overview_to_json(summary);
+    send_json_payload(http::status::ok, json::serialize(response));
 }
 
 void http_static_session::handle_dev_admin_api(const std::string& clean_target)
@@ -1153,6 +1508,720 @@ void http_static_session::handle_dev_admin_api(const std::string& clean_target)
     send_api_error(http::status::not_found, "resource not found");
 }
 
+void http_static_session::handle_dev_admin_groups_api(const std::string& clean_target)
+{
+    const auto send_api_error = [this](http::status status,
+                                       const std::string& message,
+                                       const std::string& debug = std::string()) {
+        json::object response;
+        response["ok"] = false;
+        response["message"] = message;
+        if (!debug.empty()) {
+            response["debug"] = debug;
+        }
+        send_json_payload(status, json::serialize(response));
+    };
+
+    const auto send_api_method_not_allowed = [this]() {
+        json::object response;
+        response["ok"] = false;
+        response["message"] = "method not allowed";
+        send_json_payload(http::status::method_not_allowed, json::serialize(response));
+    };
+
+    admin_user_account admin;
+    user_admin_error admin_error;
+    if (!validate_admin_cookie_session(request_, admin, admin_error)) {
+        send_api_error(http::status::unauthorized,
+                       admin_error.message.empty() ? "missing admin session" : admin_error.message,
+                       admin_error.debug);
+        return;
+    }
+    boost::ignore_unused(admin);
+
+    const std::vector<std::string> segments = split_path_segments(clean_target);
+    if (segments.size() < 3U || segments[0] != "admin" || segments[1] != "api" || segments[2] != "groups") {
+        send_api_error(http::status::not_found, "resource not found");
+        return;
+    }
+
+    const std::string request_target = std::string(request_.target());
+    const std::size_t query_pos = request_target.find('?');
+    const std::map<std::string, std::string> query_params = (query_pos == std::string::npos)
+        ? std::map<std::string, std::string>()
+        : parse_query_params(request_target.substr(query_pos + 1U));
+
+    if (segments.size() == 3U) {
+        if (request_.method() != http::verb::get) {
+            send_api_method_not_allowed();
+            return;
+        }
+
+        admin_group_list_options options;
+        const auto keyword_it = query_params.find("keyword");
+        if (keyword_it != query_params.end()) {
+            options.keyword = keyword_it->second;
+        }
+        options.group_numeric_id = parse_unsigned_long_long_query(query_params, "group_numeric_id", 0ULL);
+        options.owner_user_id = parse_unsigned_long_long_query(query_params, "owner_user_id", 0ULL);
+        options.limit = parse_size_query(query_params, "limit", 50U);
+
+        std::vector<admin_group_record> groups;
+        user_admin_error error;
+        if (!list_admin_groups(options, groups, error)) {
+            send_api_error(to_http_status(error.code), error.message, error.debug);
+            return;
+        }
+
+        json::array items;
+        for (const admin_group_record& group : groups) {
+            items.push_back(admin_group_to_json(group));
+        }
+
+        json::object response;
+        response["ok"] = true;
+        response["message"] = "groups loaded";
+        response["count"] = static_cast<std::uint64_t>(groups.size());
+        response["groups"] = std::move(items);
+        send_json_payload(http::status::ok, json::serialize(response));
+        return;
+    }
+
+    if (segments.size() == 4U) {
+        if (request_.method() != http::verb::get) {
+            send_api_method_not_allowed();
+            return;
+        }
+
+        admin_group_record group;
+        std::vector<admin_group_member_record> members;
+        std::vector<admin_message_record> recent_messages;
+        user_admin_error error;
+        if (!load_admin_group_detail(segments[3], group, members, recent_messages, error)) {
+            send_api_error(to_http_status(error.code), error.message, error.debug);
+            return;
+        }
+
+        json::array member_items;
+        for (const admin_group_member_record& member : members) {
+            member_items.push_back(admin_group_member_to_json(member));
+        }
+
+        json::array message_items;
+        for (const admin_message_record& message : recent_messages) {
+            message_items.push_back(admin_message_to_json(message));
+        }
+
+        json::object response;
+        response["ok"] = true;
+        response["message"] = "group detail loaded";
+        response["group"] = admin_group_to_json(group);
+        response["members"] = std::move(member_items);
+        response["recent_messages"] = std::move(message_items);
+        send_json_payload(http::status::ok, json::serialize(response));
+        return;
+    }
+
+    send_api_error(http::status::not_found, "resource not found");
+}
+
+void http_static_session::handle_dev_admin_conversations_api(const std::string& clean_target)
+{
+    const auto send_api_error = [this](http::status status,
+                                       const std::string& message,
+                                       const std::string& debug = std::string()) {
+        json::object response;
+        response["ok"] = false;
+        response["message"] = message;
+        if (!debug.empty()) {
+            response["debug"] = debug;
+        }
+        send_json_payload(status, json::serialize(response));
+    };
+
+    const auto send_api_method_not_allowed = [this]() {
+        json::object response;
+        response["ok"] = false;
+        response["message"] = "method not allowed";
+        send_json_payload(http::status::method_not_allowed, json::serialize(response));
+    };
+
+    admin_user_account admin;
+    user_admin_error admin_error;
+    if (!validate_admin_cookie_session(request_, admin, admin_error)) {
+        send_api_error(http::status::unauthorized,
+                       admin_error.message.empty() ? "missing admin session" : admin_error.message,
+                       admin_error.debug);
+        return;
+    }
+    boost::ignore_unused(admin);
+
+    const std::vector<std::string> segments = split_path_segments(clean_target);
+    if (segments.size() < 3U || segments[0] != "admin" || segments[1] != "api" || segments[2] != "conversations") {
+        send_api_error(http::status::not_found, "resource not found");
+        return;
+    }
+
+    const std::string request_target = std::string(request_.target());
+    const std::size_t query_pos = request_target.find('?');
+    const std::map<std::string, std::string> query_params = (query_pos == std::string::npos)
+        ? std::map<std::string, std::string>()
+        : parse_query_params(request_target.substr(query_pos + 1U));
+
+    if (segments.size() == 3U) {
+        if (request_.method() != http::verb::get) {
+            send_api_method_not_allowed();
+            return;
+        }
+
+        admin_conversation_list_options options;
+        const auto keyword_it = query_params.find("keyword");
+        if (keyword_it != query_params.end()) {
+            options.keyword = keyword_it->second;
+        }
+        const auto conversation_id_it = query_params.find("conversation_id");
+        if (conversation_id_it != query_params.end()) {
+            options.conversation_id = conversation_id_it->second;
+        }
+        options.user_id = parse_unsigned_long_long_query(query_params, "user_id", 0ULL);
+        options.numeric_id = parse_unsigned_long_long_query(query_params, "numeric_id", 0ULL);
+        options.group_numeric_id = parse_unsigned_long_long_query(query_params, "group_numeric_id", 0ULL);
+        options.limit = parse_size_query(query_params, "limit", 50U);
+
+        std::vector<admin_conversation_record> conversations;
+        user_admin_error error;
+        if (!list_admin_conversations(options, conversations, error)) {
+            send_api_error(to_http_status(error.code), error.message, error.debug);
+            return;
+        }
+
+        json::array items;
+        for (const admin_conversation_record& conversation : conversations) {
+            items.push_back(admin_conversation_to_json(conversation));
+        }
+
+        json::object response;
+        response["ok"] = true;
+        response["message"] = "conversations loaded";
+        response["count"] = static_cast<std::uint64_t>(conversations.size());
+        response["conversations"] = std::move(items);
+        send_json_payload(http::status::ok, json::serialize(response));
+        return;
+    }
+
+    if (segments.size() == 4U) {
+        if (request_.method() != http::verb::get) {
+            send_api_method_not_allowed();
+            return;
+        }
+
+        admin_conversation_list_options options;
+        options.conversation_id = segments[3];
+        options.limit = 1U;
+
+        std::vector<admin_conversation_record> conversations;
+        user_admin_error error;
+        if (!list_admin_conversations(options, conversations, error)) {
+            send_api_error(to_http_status(error.code), error.message, error.debug);
+            return;
+        }
+        if (conversations.empty()) {
+            send_api_error(http::status::not_found, "conversation not found");
+            return;
+        }
+
+        json::object response;
+        response["ok"] = true;
+        response["message"] = "conversation loaded";
+        response["conversation"] = admin_conversation_to_json(conversations.front());
+        send_json_payload(http::status::ok, json::serialize(response));
+        return;
+    }
+
+    if (segments.size() == 5U && segments[4] == "messages") {
+        if (request_.method() != http::verb::get) {
+            send_api_method_not_allowed();
+            return;
+        }
+
+        admin_message_list_options options;
+        options.limit = parse_size_query(query_params, "limit", 50U);
+
+        std::vector<admin_message_record> messages;
+        user_admin_error error;
+        if (!list_admin_conversation_messages(segments[3], options, messages, error)) {
+            send_api_error(to_http_status(error.code), error.message, error.debug);
+            return;
+        }
+
+        admin_conversation_list_options conversation_options;
+        conversation_options.conversation_id = segments[3];
+        conversation_options.limit = 1U;
+        std::vector<admin_conversation_record> conversations;
+        if (!list_admin_conversations(conversation_options, conversations, error)) {
+            send_api_error(to_http_status(error.code), error.message, error.debug);
+            return;
+        }
+        if (conversations.empty()) {
+            send_api_error(http::status::not_found, "conversation not found");
+            return;
+        }
+
+        json::array items;
+        for (const admin_message_record& message : messages) {
+            items.push_back(admin_message_to_json(message));
+        }
+
+        json::object response;
+        response["ok"] = true;
+        response["message"] = "messages loaded";
+        response["conversation"] = admin_conversation_to_json(conversations.front());
+        response["count"] = static_cast<std::uint64_t>(messages.size());
+        response["messages"] = std::move(items);
+        send_json_payload(http::status::ok, json::serialize(response));
+        return;
+    }
+
+    if (segments.size() == 5U && segments[4] == "receipts") {
+        if (request_.method() != http::verb::get) {
+            send_api_method_not_allowed();
+            return;
+        }
+
+        const auto message_id_it = query_params.find("message_id");
+        if (message_id_it == query_params.end() || trim_ascii_copy(message_id_it->second).empty()) {
+            send_api_error(http::status::bad_request, "message_id is required");
+            return;
+        }
+
+        std::vector<admin_message_receipt_record> receipts;
+        user_admin_error error;
+        if (!list_admin_message_receipts(segments[3], message_id_it->second, receipts, error)) {
+            send_api_error(to_http_status(error.code), error.message, error.debug);
+            return;
+        }
+
+        json::array items;
+        for (const admin_message_receipt_record& receipt : receipts) {
+            items.push_back(admin_message_receipt_to_json(receipt));
+        }
+
+        json::object response;
+        response["ok"] = true;
+        response["message"] = "message receipts loaded";
+        response["conversation_id"] = segments[3];
+        response["message_id"] = message_id_it->second;
+        response["count"] = static_cast<std::uint64_t>(receipts.size());
+        response["receipts"] = std::move(items);
+        send_json_payload(http::status::ok, json::serialize(response));
+        return;
+    }
+
+    send_api_error(http::status::not_found, "resource not found");
+}
+
+void http_static_session::handle_dev_admin_sessions_api(const std::string& clean_target)
+{
+    const auto send_api_error = [this](http::status status,
+                                       const std::string& message,
+                                       const std::string& debug = std::string()) {
+        json::object response;
+        response["ok"] = false;
+        response["message"] = message;
+        if (!debug.empty()) {
+            response["debug"] = debug;
+        }
+        send_json_payload(status, json::serialize(response));
+    };
+
+    if (request_.method() != http::verb::get) {
+        json::object response;
+        response["ok"] = false;
+        response["message"] = "method not allowed";
+        send_json_payload(http::status::method_not_allowed, json::serialize(response));
+        return;
+    }
+
+    const std::vector<std::string> segments = split_path_segments(clean_target);
+    if (segments.size() != 3U || segments[0] != "admin" || segments[1] != "api" || segments[2] != "sessions") {
+        send_api_error(http::status::not_found, "resource not found");
+        return;
+    }
+
+    admin_user_account admin;
+    user_admin_error admin_error;
+    if (!validate_admin_cookie_session(request_, admin, admin_error)) {
+        send_api_error(http::status::unauthorized,
+                       admin_error.message.empty() ? "missing admin session" : admin_error.message,
+                       admin_error.debug);
+        return;
+    }
+    boost::ignore_unused(admin);
+
+    const std::string request_target = std::string(request_.target());
+    const std::size_t query_pos = request_target.find('?');
+    const std::map<std::string, std::string> query_params = (query_pos == std::string::npos)
+        ? std::map<std::string, std::string>()
+        : parse_query_params(request_target.substr(query_pos + 1U));
+
+    user_list_options options;
+    const auto keyword_it = query_params.find("keyword");
+    if (keyword_it != query_params.end()) {
+        options.keyword = keyword_it->second;
+    }
+    options.limit = parse_size_query(query_params, "limit", 100U);
+    options.include_disabled = parse_bool_query(query_params, "include_disabled", true);
+    const bool online_only = parse_bool_query(query_params, "online_only", false);
+
+    std::vector<managed_user_record> users;
+    user_admin_error error;
+    if (!list_managed_users(options, users, error)) {
+        send_api_error(to_http_status(error.code), error.message, error.debug);
+        return;
+    }
+
+    std::map<std::uint64_t, std::size_t> active_session_counts = snapshot_websocket_admin_user_session_counts();
+    std::vector<websocket_admin_connection_snapshot> connections = snapshot_websocket_admin_connections();
+
+    const std::string keyword_lowered = to_lower_ascii_copy(trim_ascii_copy(options.keyword));
+    if (!keyword_lowered.empty()) {
+        connections.erase(std::remove_if(connections.begin(),
+                                         connections.end(),
+                                         [&keyword_lowered](const websocket_admin_connection_snapshot& snapshot) {
+                                             const std::string remote = to_lower_ascii_copy(snapshot.remote_endpoint);
+                                             const std::string username = to_lower_ascii_copy(snapshot.authenticated_username);
+                                             const std::string user_id = std::to_string(snapshot.authenticated_user_id);
+                                             const std::string numeric_id = std::to_string(snapshot.authenticated_numeric_id);
+                                             return remote.find(keyword_lowered) == std::string::npos
+                                                 && username.find(keyword_lowered) == std::string::npos
+                                                 && user_id.find(keyword_lowered) == std::string::npos
+                                                 && numeric_id.find(keyword_lowered) == std::string::npos;
+                                         }),
+                          connections.end());
+    }
+
+    std::sort(connections.begin(),
+              connections.end(),
+              [](const websocket_admin_connection_snapshot& lhs,
+                 const websocket_admin_connection_snapshot& rhs) {
+                  return lhs.last_activity_at > rhs.last_activity_at;
+              });
+
+    json::array user_items;
+    std::size_t online_user_count = 0U;
+    std::size_t multi_session_user_count = 0U;
+    for (const managed_user_record& user : users) {
+        const auto count_it = active_session_counts.find(static_cast<std::uint64_t>(user.user_id));
+        const std::size_t active_sessions = (count_it == active_session_counts.end()) ? 0U : count_it->second;
+        if (online_only && active_sessions == 0U) {
+            continue;
+        }
+        if (active_sessions > 0U) {
+            ++online_user_count;
+        }
+        if (active_sessions > 1U) {
+            ++multi_session_user_count;
+        }
+
+        json::object item = managed_user_to_json(user);
+        item["active_sessions"] = static_cast<std::uint64_t>(active_sessions);
+        item["has_live_connection"] = (active_sessions > 0U);
+        item["presence_mismatch"] = (user.is_online != (active_sessions > 0U));
+        user_items.push_back(std::move(item));
+    }
+
+    json::array connection_items;
+    std::size_t authenticated_connection_count = 0U;
+    for (const websocket_admin_connection_snapshot& snapshot : connections) {
+        if (snapshot.authenticated_user_id != 0ULL) {
+            ++authenticated_connection_count;
+        }
+        connection_items.push_back(websocket_connection_to_json(snapshot));
+    }
+
+    json::object response;
+    response["ok"] = true;
+    response["message"] = "session snapshot loaded";
+    response["online_only"] = online_only;
+    response["users_count"] = static_cast<std::uint64_t>(user_items.size());
+    response["online_users_count"] = static_cast<std::uint64_t>(online_user_count);
+    response["multi_session_users_count"] = static_cast<std::uint64_t>(multi_session_user_count);
+    response["connections_count"] = static_cast<std::uint64_t>(connections.size());
+    response["authenticated_connections_count"] = static_cast<std::uint64_t>(authenticated_connection_count);
+    response["users"] = std::move(user_items);
+    response["connections"] = std::move(connection_items);
+    send_json_payload(http::status::ok, json::serialize(response));
+}
+
+void http_static_session::handle_dev_admin_files_api(const std::string& clean_target)
+{
+    const auto send_api_error = [this](http::status status,
+                                       const std::string& message,
+                                       const std::string& debug = std::string()) {
+        json::object response;
+        response["ok"] = false;
+        response["message"] = message;
+        if (!debug.empty()) {
+            response["debug"] = debug;
+        }
+        send_json_payload(status, json::serialize(response));
+    };
+
+    const auto send_api_method_not_allowed = [this]() {
+        json::object response;
+        response["ok"] = false;
+        response["message"] = "method not allowed";
+        send_json_payload(http::status::method_not_allowed, json::serialize(response));
+    };
+
+    admin_user_account admin;
+    user_admin_error admin_error;
+    if (!validate_admin_cookie_session(request_, admin, admin_error)) {
+        send_api_error(http::status::unauthorized,
+                       admin_error.message.empty() ? "missing admin session" : admin_error.message,
+                       admin_error.debug);
+        return;
+    }
+    boost::ignore_unused(admin);
+
+    const std::vector<std::string> segments = split_path_segments(clean_target);
+    if (segments.size() < 4U || segments[0] != "admin" || segments[1] != "api" || segments[2] != "files") {
+        send_api_error(http::status::not_found, "resource not found");
+        return;
+    }
+
+    const std::string request_target = std::string(request_.target());
+    const std::size_t query_pos = request_target.find('?');
+    const std::map<std::string, std::string> query_params = (query_pos == std::string::npos)
+        ? std::map<std::string, std::string>()
+        : parse_query_params(request_target.substr(query_pos + 1U));
+
+    if (segments.size() == 4U && segments[3] == "avatars") {
+        if (request_.method() != http::verb::get) {
+            send_api_method_not_allowed();
+            return;
+        }
+
+        user_list_options options;
+        const auto keyword_it = query_params.find("keyword");
+        if (keyword_it != query_params.end()) {
+            options.keyword = keyword_it->second;
+        }
+        options.limit = parse_size_query(query_params, "limit", 100U);
+        options.include_disabled = parse_bool_query(query_params, "include_disabled", true);
+
+        std::vector<managed_user_record> users;
+        user_admin_error error;
+        if (!list_managed_users(options, users, error)) {
+            send_api_error(to_http_status(error.code), error.message, error.debug);
+            return;
+        }
+
+        json::array items;
+        for (const managed_user_record& user : users) {
+            const avatar_asset_probe probe = probe_avatar_asset(static_root_, user.user_id);
+            json::object item = managed_user_to_json(user);
+            item["profile_avatar_url"] = user.avatar_url;
+            item["avatar_file_exists"] = probe.exists;
+            item["avatar_filename"] = probe.filename;
+            item["preview_url"] = probe.exists ? build_avatar_absolute_url(probe.filename) : "";
+            item["avatar_size_bytes"] = probe.size_bytes;
+            item["avatar_modified_at"] = probe.modified_at;
+            items.push_back(std::move(item));
+        }
+
+        json::object response;
+        response["ok"] = true;
+        response["message"] = "avatar metadata loaded";
+        response["count"] = static_cast<std::uint64_t>(items.size());
+        response["avatars"] = std::move(items);
+        send_json_payload(http::status::ok, json::serialize(response));
+        return;
+    }
+
+    if (segments.size() == 4U && segments[3] == "chat") {
+        if (request_.method() != http::verb::get) {
+            send_api_method_not_allowed();
+            return;
+        }
+
+        admin_chat_file_list_options options;
+        const auto keyword_it = query_params.find("keyword");
+        if (keyword_it != query_params.end()) {
+            options.keyword = keyword_it->second;
+        }
+        const auto conversation_it = query_params.find("conversation_id");
+        if (conversation_it != query_params.end()) {
+            options.conversation_id = conversation_it->second;
+        }
+        const auto file_id_it = query_params.find("file_id");
+        if (file_id_it != query_params.end()) {
+            options.file_id = file_id_it->second;
+        }
+        options.uploader_user_id = parse_unsigned_long_long_query(query_params, "uploader_user_id", 0ULL);
+        options.limit = parse_size_query(query_params, "limit", 50U);
+
+        std::vector<admin_chat_file_record> files;
+        user_admin_error error;
+        if (!list_admin_chat_files(options, files, error)) {
+            send_api_error(to_http_status(error.code), error.message, error.debug);
+            return;
+        }
+
+        json::array items;
+        for (const admin_chat_file_record& file : files) {
+            json::object item = admin_chat_file_to_json(file);
+            std::string safe_relative_path;
+            std::string absolute_path;
+            const bool path_ok = resolve_static_relative_path(static_root_,
+                                                              file.stored_relative_path,
+                                                              safe_relative_path,
+                                                              absolute_path);
+            const local_file_probe probe = path_ok ? probe_local_file(absolute_path) : local_file_probe{};
+            item["safe_relative_path"] = safe_relative_path;
+            item["file_exists"] = probe.exists;
+            item["local_size_bytes"] = probe.size_bytes;
+            item["local_modified_at"] = probe.modified_at;
+            item["download_url"] = std::string("/admin/api/files/chat/")
+                + file.file_id + "/download";
+            items.push_back(std::move(item));
+        }
+
+        json::object response;
+        response["ok"] = true;
+        response["message"] = "chat file metadata loaded";
+        response["count"] = static_cast<std::uint64_t>(items.size());
+        response["chat_files"] = std::move(items);
+        send_json_payload(http::status::ok, json::serialize(response));
+        return;
+    }
+
+    if (segments.size() == 5U && segments[3] == "chat") {
+        if (request_.method() != http::verb::get) {
+            send_api_method_not_allowed();
+            return;
+        }
+
+        admin_chat_file_record file;
+        user_admin_error error;
+        if (!load_admin_chat_file(segments[4], file, error)) {
+            send_api_error(to_http_status(error.code), error.message, error.debug);
+            return;
+        }
+
+        json::object item = admin_chat_file_to_json(file);
+        std::string safe_relative_path;
+        std::string absolute_path;
+        const bool path_ok = resolve_static_relative_path(static_root_,
+                                                          file.stored_relative_path,
+                                                          safe_relative_path,
+                                                          absolute_path);
+        const local_file_probe probe = path_ok ? probe_local_file(absolute_path) : local_file_probe{};
+        item["safe_relative_path"] = safe_relative_path;
+        item["file_exists"] = probe.exists;
+        item["local_size_bytes"] = probe.size_bytes;
+        item["local_modified_at"] = probe.modified_at;
+        item["download_url"] = std::string("/admin/api/files/chat/")
+            + file.file_id + "/download";
+
+        json::object response;
+        response["ok"] = true;
+        response["message"] = "chat file loaded";
+        response["chat_file"] = std::move(item);
+        send_json_payload(http::status::ok, json::serialize(response));
+        return;
+    }
+
+    send_api_error(http::status::not_found, "resource not found");
+}
+
+void http_static_session::handle_dev_admin_chat_file_download_api(const std::string& file_id)
+{
+    if (request_.method() != http::verb::get && request_.method() != http::verb::head) {
+        json::object response;
+        response["ok"] = false;
+        response["message"] = "method not allowed";
+        send_json_payload(http::status::method_not_allowed, json::serialize(response));
+        return;
+    }
+
+    admin_user_account admin;
+    user_admin_error admin_error;
+    if (!validate_admin_cookie_session(request_, admin, admin_error)) {
+        json::object response;
+        response["ok"] = false;
+        response["message"] = admin_error.message.empty() ? "missing admin session" : admin_error.message;
+        if (!admin_error.debug.empty()) {
+            response["debug"] = admin_error.debug;
+        }
+        send_json_payload(http::status::unauthorized, json::serialize(response));
+        return;
+    }
+    boost::ignore_unused(admin);
+
+    admin_chat_file_record record;
+    user_admin_error error;
+    if (!load_admin_chat_file(file_id, record, error)) {
+        json::object response;
+        response["ok"] = false;
+        response["message"] = error.message;
+        if (!error.debug.empty()) {
+            response["debug"] = error.debug;
+        }
+        send_json_payload(to_http_status(error.code), json::serialize(response));
+        return;
+    }
+
+    std::string safe_relative_path;
+    std::string file_path;
+    if (!resolve_static_relative_path(static_root_, record.stored_relative_path, safe_relative_path, file_path)) {
+        send_json_response(http::status::internal_server_error, false, "chat file path is invalid");
+        return;
+    }
+
+    beast::error_code file_ec;
+    http::file_body::value_type body;
+    body.open(file_path.c_str(), beast::file_mode::scan, file_ec);
+    if (file_ec) {
+        const http::status status = (file_ec == beast::errc::no_such_file_or_directory)
+            ? http::status::not_found
+            : http::status::internal_server_error;
+        send_json_response(status, false, "chat file is unavailable");
+        return;
+    }
+
+    const std::uint64_t file_size = body.size();
+    const std::string content_type = record.content_type.empty()
+        ? mime_type_from_path(file_path)
+        : record.content_type;
+    const std::string disposition = std::string("attachment; filename=\"")
+        + json_escape(record.original_name) + "\"";
+
+    if (request_.method() == http::verb::head) {
+        http::response<http::empty_body> response{http::status::ok, request_.version()};
+        response.set(http::field::server, BOOST_BEAST_VERSION_STRING);
+        response.set(http::field::content_type, content_type);
+        response.set(http::field::content_disposition, disposition);
+        response.set(http::field::cache_control, "no-store");
+        response.set("X-Content-Type-Options", "nosniff");
+        response.keep_alive(false);
+        response.content_length(file_size);
+        send_response(std::move(response));
+        return;
+    }
+
+    http::response<http::file_body> response{http::status::ok, request_.version()};
+    response.set(http::field::server, BOOST_BEAST_VERSION_STRING);
+    response.set(http::field::content_type, content_type);
+    response.set(http::field::content_disposition, disposition);
+    response.set(http::field::cache_control, "no-store");
+    response.set("X-Content-Type-Options", "nosniff");
+    response.keep_alive(false);
+    response.content_length(file_size);
+    response.body() = std::move(body);
+    send_response(std::move(response));
+}
+
 void http_static_session::handle_request()
 {
     if (request_.method() == http::verb::post && request_.target() == "/upload/avatar") {
@@ -1167,23 +2236,61 @@ void http_static_session::handle_request()
     const std::size_t query_pos = request_target.find('?');
     const std::string clean_target = request_target.substr(0U, query_pos);
     if (clean_target == "/admin" || clean_target == "/admin/") {
-        send_redirect_response("/admin/users");
+        send_redirect_response("/admin/overview");
         return;
     }
     if (clean_target == "/admin/login") {
         handle_dev_admin_login_page();
         return;
     }
-    if (clean_target == "/admin/users") {
-        handle_dev_admin_page();
+    if (clean_target == "/admin/overview"
+        || clean_target == "/admin/users"
+        || clean_target == "/admin/groups"
+        || clean_target == "/admin/conversations"
+        || clean_target == "/admin/sessions"
+        || clean_target == "/admin/files") {
+        handle_dev_admin_page(clean_target);
         return;
     }
-    if (clean_target.rfind("/admin/api/session", 0U) == 0U) {
-        handle_dev_admin_session_api(clean_target);
+    if (clean_target == "/admin/api/overview") {
+        handle_dev_admin_overview_api();
         return;
     }
     if (clean_target.rfind("/admin/api/users", 0U) == 0U) {
         handle_dev_admin_api(clean_target);
+        return;
+    }
+    if (clean_target.rfind("/admin/api/groups", 0U) == 0U) {
+        handle_dev_admin_groups_api(clean_target);
+        return;
+    }
+    if (clean_target.rfind("/admin/api/conversations", 0U) == 0U) {
+        handle_dev_admin_conversations_api(clean_target);
+        return;
+    }
+    if (clean_target == "/admin/api/sessions") {
+        handle_dev_admin_sessions_api(clean_target);
+        return;
+    }
+    if (clean_target == "/admin/api/session" || clean_target.rfind("/admin/api/session/", 0U) == 0U) {
+        handle_dev_admin_session_api(clean_target);
+        return;
+    }
+    static const std::string admin_chat_download_prefix = "/admin/api/files/chat/";
+    static const std::string admin_chat_download_suffix = "/download";
+    if ((request_.method() == http::verb::get || request_.method() == http::verb::head)
+        && clean_target.rfind(admin_chat_download_prefix, 0U) == 0U
+        && clean_target.size() > admin_chat_download_prefix.size() + admin_chat_download_suffix.size()
+        && clean_target.compare(clean_target.size() - admin_chat_download_suffix.size(),
+                                admin_chat_download_suffix.size(),
+                                admin_chat_download_suffix) == 0) {
+        const std::size_t file_id_begin = admin_chat_download_prefix.size();
+        const std::size_t file_id_length = clean_target.size() - file_id_begin - admin_chat_download_suffix.size();
+        handle_dev_admin_chat_file_download_api(clean_target.substr(file_id_begin, file_id_length));
+        return;
+    }
+    if (clean_target.rfind("/admin/api/files", 0U) == 0U) {
+        handle_dev_admin_files_api(clean_target);
         return;
     }
     static const std::string chat_download_prefix = "/download/chat-file/";

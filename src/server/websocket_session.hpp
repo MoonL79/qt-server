@@ -7,7 +7,9 @@
 #include <boost/json.hpp>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <iostream>
 #include <vector>
@@ -21,6 +23,21 @@ namespace websocket = beast::websocket; // from <boost/beast/websocket.hpp>
 namespace net = boost::asio;            // from <boost/asio.hpp>
 namespace json = boost::json;           // from <boost/json.hpp>
 using tcp = boost::asio::ip::tcp;       // from <boost/asio/ip/tcp.hpp>
+
+struct websocket_admin_connection_snapshot
+{
+    std::string remote_endpoint;
+    std::string authenticated_username;
+    std::string connected_at;
+    std::string last_read_at;
+    std::string last_write_at;
+    std::string last_activity_at;
+    std::string state;
+    std::uint64_t authenticated_user_id = 0;
+    std::uint64_t authenticated_numeric_id = 0;
+    std::size_t pending_writes = 0U;
+    bool write_in_progress = false;
+};
 
 // Echoes back all received WebSocket messages
 class websocket_session : public std::enable_shared_from_this<websocket_session>
@@ -67,6 +84,17 @@ class websocket_session : public std::enable_shared_from_this<websocket_session>
     std::uint64_t authenticated_user_id_ = 0;
     std::uint64_t authenticated_numeric_id_ = 0;
     std::string authenticated_username_;
+    mutable std::mutex admin_runtime_mutex_;
+    std::string connected_at_;
+    std::string last_read_at_;
+    std::string last_write_at_;
+    std::string last_activity_at_;
+    std::string connection_state_;
+    std::string admin_authenticated_username_;
+    std::uint64_t admin_authenticated_user_id_ = 0;
+    std::uint64_t admin_authenticated_numeric_id_ = 0;
+    std::size_t admin_pending_writes_ = 0U;
+    bool admin_write_in_progress_ = false;
 
 public:
     // Take ownership of the socket
@@ -75,6 +103,7 @@ public:
 
     // Start the asynchronous operation
     void run();
+    websocket_admin_connection_snapshot admin_snapshot() const;
 
 private:
     static bool is_supported_type(const std::string& type);
@@ -221,6 +250,9 @@ private:
 
     void on_write(beast::error_code ec, std::size_t bytes_transferred);
 };
+
+std::vector<websocket_admin_connection_snapshot> snapshot_websocket_admin_connections();
+std::map<std::uint64_t, std::size_t> snapshot_websocket_admin_user_session_counts();
 
 } // namespace server
 } // namespace qt_server

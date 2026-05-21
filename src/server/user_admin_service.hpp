@@ -65,6 +65,151 @@ struct create_user_request
     unsigned int status = 1U;
 };
 
+struct admin_overview_summary
+{
+    std::size_t total_users = 0U;
+    std::size_t enabled_users = 0U;
+    std::size_t disabled_users = 0U;
+    std::size_t online_users = 0U;
+    std::size_t recent_login_users = 0U;
+    std::size_t recent_seen_users = 0U;
+    std::vector<managed_user_record> recent_users;
+};
+
+struct admin_group_list_options
+{
+    std::string keyword;
+    unsigned long long group_numeric_id = 0ULL;
+    unsigned long long owner_user_id = 0ULL;
+    std::size_t limit = 50U;
+};
+
+struct admin_conversation_list_options
+{
+    std::string keyword;
+    std::string conversation_id;
+    unsigned long long user_id = 0ULL;
+    unsigned long long numeric_id = 0ULL;
+    unsigned long long group_numeric_id = 0ULL;
+    std::size_t limit = 50U;
+};
+
+struct admin_message_list_options
+{
+    std::size_t limit = 50U;
+};
+
+struct admin_chat_file_list_options
+{
+    std::string keyword;
+    std::string conversation_id;
+    std::string file_id;
+    unsigned long long uploader_user_id = 0ULL;
+    std::size_t limit = 50U;
+};
+
+struct admin_group_record
+{
+    std::string conversation_id;
+    unsigned long long group_numeric_id = 0ULL;
+    std::string name;
+    std::string avatar_url;
+    std::string notice;
+    unsigned long long owner_user_id = 0ULL;
+    unsigned long long owner_numeric_id = 0ULL;
+    std::string owner_username;
+    std::string owner_nickname;
+    std::size_t member_count = 0U;
+    std::string created_at;
+    std::string updated_at;
+    unsigned long long last_message_seq = 0ULL;
+    std::string last_message_id;
+    std::string last_message_sent_at;
+};
+
+struct admin_group_member_record
+{
+    unsigned long long user_id = 0ULL;
+    unsigned long long numeric_id = 0ULL;
+    std::string username;
+    std::string nickname;
+    std::string avatar_url;
+    unsigned int status = 0U;
+    bool is_online = false;
+    std::string last_seen_at;
+    unsigned int role = 0U;
+    std::string mute_until;
+};
+
+struct admin_conversation_record
+{
+    std::string conversation_id;
+    unsigned int conversation_type = 0U;
+    unsigned long long group_numeric_id = 0ULL;
+    std::string name;
+    std::string avatar_url;
+    std::string notice;
+    unsigned long long owner_user_id = 0ULL;
+    std::size_t member_count = 0U;
+    std::string created_at;
+    std::string updated_at;
+    unsigned long long last_message_seq = 0ULL;
+    std::string last_message_id;
+    std::string last_message_sent_at;
+    std::string participants_summary;
+};
+
+struct admin_message_record
+{
+    std::string conversation_id;
+    std::string message_id;
+    unsigned long long seq = 0ULL;
+    unsigned long long message_type = 0ULL;
+    std::string message_kind;
+    std::string content_preview;
+    std::string content_json;
+    std::string file_id;
+    std::string file_name;
+    unsigned long long file_size_bytes = 0ULL;
+    std::string sent_at;
+    unsigned long long sender_user_id = 0ULL;
+    unsigned long long sender_numeric_id = 0ULL;
+    std::string sender_username;
+    std::size_t receipt_total = 0U;
+    std::size_t delivered_count = 0U;
+    std::size_t pending_count = 0U;
+};
+
+struct admin_message_receipt_record
+{
+    unsigned long long user_id = 0ULL;
+    unsigned long long numeric_id = 0ULL;
+    std::string username;
+    std::string nickname;
+    bool delivered = false;
+    std::string delivered_at;
+};
+
+struct admin_chat_file_record
+{
+    std::string file_id;
+    std::string conversation_id;
+    unsigned long long uploader_user_id = 0ULL;
+    unsigned long long uploader_numeric_id = 0ULL;
+    std::string uploader_username;
+    std::string uploader_nickname;
+    std::string original_name;
+    std::string stored_name;
+    std::string stored_relative_path;
+    std::string content_type;
+    std::string sha256;
+    std::size_t size_bytes = 0U;
+    bool attached = false;
+    std::string bound_message_id;
+    std::string created_at;
+    std::string attached_at;
+};
+
 struct update_user_request
 {
     unsigned long long user_id = 0ULL;
@@ -103,6 +248,33 @@ struct admin_login_result
 bool list_managed_users(const user_list_options& options,
                         std::vector<managed_user_record>& users,
                         user_admin_error& error);
+bool load_admin_overview(admin_overview_summary& summary,
+                         user_admin_error& error);
+bool list_admin_groups(const admin_group_list_options& options,
+                       std::vector<admin_group_record>& groups,
+                       user_admin_error& error);
+bool load_admin_group_detail(const std::string& conversation_id,
+                             admin_group_record& group,
+                             std::vector<admin_group_member_record>& members,
+                             std::vector<admin_message_record>& recent_messages,
+                             user_admin_error& error);
+bool list_admin_conversations(const admin_conversation_list_options& options,
+                              std::vector<admin_conversation_record>& conversations,
+                              user_admin_error& error);
+bool list_admin_conversation_messages(const std::string& conversation_id,
+                                      const admin_message_list_options& options,
+                                      std::vector<admin_message_record>& messages,
+                                      user_admin_error& error);
+bool list_admin_message_receipts(const std::string& conversation_id,
+                                 const std::string& message_id,
+                                 std::vector<admin_message_receipt_record>& receipts,
+                                 user_admin_error& error);
+bool list_admin_chat_files(const admin_chat_file_list_options& options,
+                           std::vector<admin_chat_file_record>& files,
+                           user_admin_error& error);
+bool load_admin_chat_file(const std::string& file_id,
+                          admin_chat_file_record& file,
+                          user_admin_error& error);
 bool create_managed_user(const create_user_request& request,
                          managed_user_record& created_user,
                          user_admin_error& error);

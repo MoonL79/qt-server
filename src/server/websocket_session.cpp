@@ -29,6 +29,8 @@ namespace {
 
 std::mutex g_presence_mutex;
 std::unordered_map<unsigned long long, std::size_t> g_online_session_counts;
+std::mutex g_live_sessions_mutex;
+std::vector<std::weak_ptr<websocket_session>> g_live_sessions;
 std::mutex g_authenticated_sessions_mutex;
 std::unordered_map<unsigned long long, std::vector<std::weak_ptr<websocket_session>>> g_authenticated_sessions;
 const char* k_avatar_upload_purpose = "avatar_upload";
@@ -56,6 +58,7 @@ struct conversation_message_summary
 };
 
 json::object build_mysql_config_debug(const mysql_config& cfg);
+std::string now_utc_iso8601();
 
 void prune_expired_session_refs(std::vector<std::weak_ptr<websocket_session>>& sessions)
 {
@@ -65,6 +68,52 @@ void prune_expired_session_refs(std::vector<std::weak_ptr<websocket_session>>& s
                                       return entry.expired();
                                   }),
                    sessions.end());
+}
+
+void register_live_session(const std::shared_ptr<websocket_session>& session)
+{
+    if (!session) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_live_sessions_mutex);
+    prune_expired_session_refs(g_live_sessions);
+    for (const std::weak_ptr<websocket_session>& entry : g_live_sessions) {
+        const std::shared_ptr<websocket_session> existing = entry.lock();
+        if (existing && existing.get() == session.get()) {
+            return;
+        }
+    }
+    g_live_sessions.push_back(session);
+}
+
+void unregister_live_session(const websocket_session* session)
+{
+    if (session == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_live_sessions_mutex);
+    g_live_sessions.erase(std::remove_if(g_live_sessions.begin(),
+                                         g_live_sessions.end(),
+                                         [session](const std::weak_ptr<websocket_session>& entry) {
+                                             const std::shared_ptr<websocket_session> existing = entry.lock();
+                                             return !existing || existing.get() == session;
+                                         }),
+                          g_live_sessions.end());
+}
+
+std::vector<std::shared_ptr<websocket_session>> snapshot_live_sessions()
+{
+    std::vector<std::shared_ptr<websocket_session>> sessions;
+    std::lock_guard<std::mutex> lock(g_live_sessions_mutex);
+    prune_expired_session_refs(g_live_sessions);
+    sessions.reserve(g_live_sessions.size());
+    for (const std::weak_ptr<websocket_session>& entry : g_live_sessions) {
+        const std::shared_ptr<websocket_session> session = entry.lock();
+        if (session) {
+            sessions.push_back(session);
+        }
+    }
+    return sessions;
 }
 
 void register_authenticated_session(unsigned long long user_id,
@@ -5152,6 +5201,14 @@ void websocket_session::bind_authenticated_user(std::uint64_t user_id,
                   << " numeric_id=" << numeric_id << std::endl;
         authenticated_numeric_id_ = numeric_id;
         authenticated_username_ = username;
+        {
+            std::lock_guard<std::mutex> lock(admin_runtime_mutex_);
+            admin_authenticated_user_id_ = user_id;
+            admin_authenticated_numeric_id_ = numeric_id;
+            admin_authenticated_username_ = username;
+            last_activity_at_ = now_utc_iso8601();
+            connection_state_ = "authenticated";
+        }
         return;
     }
 
@@ -5174,6 +5231,14 @@ void websocket_session::bind_authenticated_user(std::uint64_t user_id,
     authenticated_user_id_ = user_id;
     authenticated_numeric_id_ = numeric_id;
     authenticated_username_ = username;
+    {
+        std::lock_guard<std::mutex> lock(admin_runtime_mutex_);
+        admin_authenticated_user_id_ = user_id;
+        admin_authenticated_numeric_id_ = numeric_id;
+        admin_authenticated_username_ = username;
+        last_activity_at_ = now_utc_iso8601();
+        connection_state_ = "authenticated";
+    }
     register_authenticated_session(user_id, shared_from_this());
 
     std::cout << "[presence] bind session=" << static_cast<const void*>(this)
@@ -5246,6 +5311,14 @@ void websocket_session::unbind_authenticated_user(bool explicit_logout,
     authenticated_user_id_ = 0ULL;
     authenticated_numeric_id_ = 0ULL;
     authenticated_username_.clear();
+    {
+        std::lock_guard<std::mutex> lock(admin_runtime_mutex_);
+        admin_authenticated_user_id_ = 0ULL;
+        admin_authenticated_numeric_id_ = 0ULL;
+        admin_authenticated_username_.clear();
+        last_activity_at_ = now_utc_iso8601();
+        connection_state_ = explicit_logout ? "logout" : "connected";
+    }
 
     if (should_mark_offline && !mark_user_presence(user_id, false, response_data) && response_data != nullptr) {
         (*response_data)["presence_sync_failed"] = true;
@@ -5265,6 +5338,14 @@ void websocket_session::unbind_authenticated_user(bool explicit_logout,
 websocket_session::websocket_session(tcp::socket socket)
     : ws_(std::move(socket))
 {
+    {
+        std::lock_guard<std::mutex> lock(admin_runtime_mutex_);
+        connected_at_ = now_utc_iso8601();
+        last_activity_at_ = connected_at_;
+        connection_state_ = "created";
+        admin_pending_writes_ = 0U;
+        admin_write_in_progress_ = false;
+    }
     try {
         auto endpoint = ws_.next_layer().remote_endpoint();
         remote_endpoint_ = endpoint.address().to_string() + ":" + std::to_string(endpoint.port());
@@ -5298,11 +5379,41 @@ void websocket_session::run()
             shared_from_this()));
 }
 
+websocket_admin_connection_snapshot websocket_session::admin_snapshot() const
+{
+    websocket_admin_connection_snapshot snapshot;
+    snapshot.remote_endpoint = remote_endpoint_;
+    {
+        std::lock_guard<std::mutex> lock(admin_runtime_mutex_);
+        snapshot.authenticated_username = admin_authenticated_username_;
+        snapshot.connected_at = connected_at_;
+        snapshot.last_read_at = last_read_at_;
+        snapshot.last_write_at = last_write_at_;
+        snapshot.last_activity_at = last_activity_at_;
+        snapshot.state = connection_state_;
+        snapshot.authenticated_user_id = admin_authenticated_user_id_;
+        snapshot.authenticated_numeric_id = admin_authenticated_numeric_id_;
+        snapshot.pending_writes = admin_pending_writes_;
+        snapshot.write_in_progress = admin_write_in_progress_;
+    }
+    return snapshot;
+}
+
 void websocket_session::on_accept(beast::error_code ec)
 {
     if(ec) {
         std::cerr << "accept: " << ec.message() << std::endl;
+        std::lock_guard<std::mutex> lock(admin_runtime_mutex_);
+        connection_state_ = "accept_error";
+        last_activity_at_ = now_utc_iso8601();
         return;
+    }
+
+    register_live_session(shared_from_this());
+    {
+        std::lock_guard<std::mutex> lock(admin_runtime_mutex_);
+        connection_state_ = "connected";
+        last_activity_at_ = now_utc_iso8601();
     }
 
     if (!remote_endpoint_.empty()) {
@@ -5319,6 +5430,14 @@ void websocket_session::queue_outbound_message(std::string payload)
     net::post(ws_.get_executor(),
               [self, payload = std::move(payload)]() mutable {
                   self->pending_writes_.push_back(std::move(payload));
+                  {
+                      std::lock_guard<std::mutex> lock(self->admin_runtime_mutex_);
+                      self->admin_pending_writes_ = self->pending_writes_.size();
+                      self->last_activity_at_ = now_utc_iso8601();
+                      if (self->connection_state_.empty() || self->connection_state_ == "connected") {
+                          self->connection_state_ = "queued";
+                      }
+                  }
                   self->start_next_write();
               });
 }
@@ -5330,6 +5449,13 @@ void websocket_session::start_next_write()
     }
 
     write_in_progress_ = true;
+    {
+        std::lock_guard<std::mutex> lock(admin_runtime_mutex_);
+        admin_pending_writes_ = pending_writes_.size();
+        admin_write_in_progress_ = true;
+        connection_state_ = "writing";
+        last_activity_at_ = now_utc_iso8601();
+    }
     ws_.text(true);
     ws_.async_write(
         net::buffer(pending_writes_.front()),
@@ -5356,6 +5482,9 @@ void websocket_session::on_read(
 
     // This indicates that the websocket_session was closed
     if(ec == websocket::error::closed) {
+        std::lock_guard<std::mutex> lock(admin_runtime_mutex_);
+        connection_state_ = "closed";
+        last_activity_at_ = now_utc_iso8601();
         std::cout << "[presence] websocket closed session=" << static_cast<const void*>(this)
                   << " remote=" << remote_endpoint_
                   << " bound_user_id=" << authenticated_user_id_
@@ -5364,6 +5493,9 @@ void websocket_session::on_read(
     }
 
     if(ec) {
+        std::lock_guard<std::mutex> lock(admin_runtime_mutex_);
+        connection_state_ = "read_error";
+        last_activity_at_ = now_utc_iso8601();
         std::cerr << "read: " << ec.message() << std::endl;
         std::cout << "[presence] websocket read error session=" << static_cast<const void*>(this)
                   << " remote=" << remote_endpoint_
@@ -5375,6 +5507,12 @@ void websocket_session::on_read(
     if (!remote_endpoint_.empty()) {
         std::cout << "WebSocket message received from " << remote_endpoint_
                   << ": " << beast::make_printable(buffer_.data()) << std::endl;
+    }
+    {
+        std::lock_guard<std::mutex> lock(admin_runtime_mutex_);
+        last_read_at_ = now_utc_iso8601();
+        last_activity_at_ = last_read_at_;
+        connection_state_ = "active";
     }
 
     const std::string payload = beast::buffers_to_string(buffer_.data());
@@ -5476,6 +5614,13 @@ void websocket_session::on_write(
 
     if(ec) {
         std::cerr << "write: " << ec.message() << std::endl;
+        {
+            std::lock_guard<std::mutex> lock(admin_runtime_mutex_);
+            admin_write_in_progress_ = false;
+            admin_pending_writes_ = 0U;
+            connection_state_ = "write_error";
+            last_activity_at_ = now_utc_iso8601();
+        }
         std::cout << "[ws] write failed"
                   << " session=" << static_cast<const void*>(this)
                   << " remote=" << remote_endpoint_
@@ -5491,20 +5636,59 @@ void websocket_session::on_write(
     if (!pending_writes_.empty()) {
         pending_writes_.pop_front();
     }
+    {
+        std::lock_guard<std::mutex> lock(admin_runtime_mutex_);
+        last_write_at_ = now_utc_iso8601();
+        last_activity_at_ = last_write_at_;
+        admin_pending_writes_ = pending_writes_.size();
+        admin_write_in_progress_ = false;
+        connection_state_ = pending_writes_.empty() ? "connected" : "queued";
+    }
     start_next_write();
 }
 
 websocket_session::~websocket_session() noexcept
 {
+    {
+        std::lock_guard<std::mutex> lock(admin_runtime_mutex_);
+        connection_state_ = "destroyed";
+        last_activity_at_ = now_utc_iso8601();
+        admin_pending_writes_ = 0U;
+        admin_write_in_progress_ = false;
+    }
     std::cout << "[presence] session destroying session=" << static_cast<const void*>(this)
               << " remote=" << remote_endpoint_
               << " bound_user_id=" << authenticated_user_id_
               << " bound_numeric_id=" << authenticated_numeric_id_
               << std::endl;
+    unregister_live_session(this);
     unbind_authenticated_user(false, nullptr);
     if (!remote_endpoint_.empty()) {
         std::cout << "WebSocket session closed for " << remote_endpoint_ << std::endl;
     }
+}
+
+std::vector<websocket_admin_connection_snapshot> snapshot_websocket_admin_connections()
+{
+    const std::vector<std::shared_ptr<websocket_session>> sessions = snapshot_live_sessions();
+    std::vector<websocket_admin_connection_snapshot> snapshots;
+    snapshots.reserve(sessions.size());
+    for (const std::shared_ptr<websocket_session>& session : sessions) {
+        if (session) {
+            snapshots.push_back(session->admin_snapshot());
+        }
+    }
+    return snapshots;
+}
+
+std::map<std::uint64_t, std::size_t> snapshot_websocket_admin_user_session_counts()
+{
+    std::map<std::uint64_t, std::size_t> counts;
+    std::lock_guard<std::mutex> lock(g_presence_mutex);
+    for (const auto& entry : g_online_session_counts) {
+        counts[static_cast<std::uint64_t>(entry.first)] = entry.second;
+    }
+    return counts;
 }
 
 } // namespace server

@@ -1,5 +1,6 @@
 #include "user_admin_service.hpp"
 
+#include <boost/json.hpp>
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -22,6 +23,8 @@
 
 namespace qt_server {
 namespace server {
+
+namespace json = boost::json;
 
 std::string default_bootstrap_admin_username();
 std::string default_bootstrap_admin_password();
@@ -85,6 +88,20 @@ std::string sql_escape(const std::string& input)
     return out;
 }
 
+std::string mysql_sanitized_sql(const std::string& expr, const std::string& fallback_sql)
+{
+    return "REPLACE(REPLACE(REPLACE(COALESCE("
+        + expr
+        + ", "
+        + fallback_sql
+        + "), CHAR(13), ' '), CHAR(10), ' '), CHAR(9), ' ')";
+}
+
+std::string mysql_text_sql(const std::string& expr)
+{
+    return mysql_sanitized_sql(expr, "''");
+}
+
 std::string shell_quote(const std::string& input)
 {
     std::string out = "'";
@@ -138,9 +155,12 @@ std::vector<std::string> collect_non_empty_lines(const std::string& text)
     std::istringstream iss(text);
     std::string line;
     while (std::getline(iss, line)) {
-        const std::string trimmed = trim_copy(line);
-        if (!trimmed.empty()) {
-            lines.push_back(trimmed);
+        std::string normalized = line;
+        if (!normalized.empty() && normalized.back() == '\r') {
+            normalized.pop_back();
+        }
+        if (!trim_copy(normalized).empty()) {
+            lines.push_back(normalized);
         }
     }
     return lines;
@@ -917,14 +937,14 @@ std::string build_user_select_sql()
     sql << "SELECT "
         << "u.id, "
         << "COALESCE(u.numeric_id, 0), "
-        << "u.username, "
-        << "u.email, "
-        << "COALESCE(u.phone, ''), "
+        << mysql_text_sql("u.username") << ", "
+        << mysql_text_sql("u.email") << ", "
+        << mysql_text_sql("u.phone") << ", "
         << "u.status, "
-        << "COALESCE(p.user_uuid, ''), "
-        << "COALESCE(p.nickname, ''), "
-        << "COALESCE(p.avatar_url, ''), "
-        << "COALESCE(p.bio, ''), "
+        << mysql_text_sql("p.user_uuid") << ", "
+        << mysql_text_sql("p.nickname") << ", "
+        << mysql_text_sql("p.avatar_url") << ", "
+        << mysql_text_sql("p.bio") << ", "
         << "COALESCE(p.is_online, 0), "
         << "COALESCE(DATE_FORMAT(p.last_seen_at, '%Y-%m-%d %H:%i:%s'), ''), "
         << "COALESCE(DATE_FORMAT(u.last_login_at, '%Y-%m-%d %H:%i:%s'), ''), "
@@ -1008,6 +1028,312 @@ bool validate_common_user_fields(const std::string& email,
     return true;
 }
 
+std::string json_string_or_empty(const json::object& obj, const char* field)
+{
+    const auto it = obj.find(field);
+    if (it == obj.end() || !it->value().is_string()) {
+        return "";
+    }
+    return std::string(it->value().as_string().c_str());
+}
+
+std::string truncate_text(const std::string& input, std::size_t max_len)
+{
+    if (input.size() <= max_len) {
+        return input;
+    }
+    if (max_len <= 3U) {
+        return input.substr(0U, max_len);
+    }
+    return input.substr(0U, max_len - 3U) + "...";
+}
+
+void summarize_message_content(unsigned long long message_type,
+                               const std::string& content_json,
+                               std::string& message_kind,
+                               std::string& content_preview,
+                               std::string& file_id,
+                               std::string& file_name,
+                               unsigned long long& file_size_bytes)
+{
+    message_kind = "unknown";
+    content_preview = truncate_text(content_json, 160U);
+    file_id.clear();
+    file_name.clear();
+    file_size_bytes = 0ULL;
+
+    json::error_code ec;
+    json::value raw = json::parse(content_json.empty() ? "{}" : content_json, ec);
+    if (ec || !raw.is_object()) {
+        return;
+    }
+
+    const json::object& obj = raw.as_object();
+    if (message_type == 1ULL) {
+        message_kind = "text";
+        const std::string text = json_string_or_empty(obj, "text");
+        content_preview = text.empty() ? "(空文本消息)" : truncate_text(text, 160U);
+        return;
+    }
+
+    if (message_type == 2ULL) {
+        message_kind = "file";
+        file_id = json_string_or_empty(obj, "file_id");
+        file_name = json_string_or_empty(obj, "original_name");
+        if (file_name.empty()) {
+            file_name = json_string_or_empty(obj, "stored_name");
+        }
+        const auto size_it = obj.find("size_bytes");
+        if (size_it != obj.end()) {
+            if (size_it->value().is_uint64()) {
+                file_size_bytes = size_it->value().as_uint64();
+            } else if (size_it->value().is_int64() && size_it->value().as_int64() > 0) {
+                file_size_bytes = static_cast<unsigned long long>(size_it->value().as_int64());
+            } else if (size_it->value().is_string()) {
+                parse_unsigned_long_long(std::string(size_it->value().as_string().c_str()), file_size_bytes);
+            }
+        }
+        std::ostringstream preview;
+        preview << "文件";
+        if (!file_name.empty()) {
+            preview << ": " << file_name;
+        }
+        if (file_size_bytes > 0ULL) {
+            preview << " (" << file_size_bytes << " B)";
+        }
+        content_preview = preview.str();
+        return;
+    }
+}
+
+bool parse_admin_group_cols(const std::vector<std::string>& cols,
+                            admin_group_record& group)
+{
+    if (cols.size() < 15U) {
+        return false;
+    }
+
+    unsigned long long group_numeric_id = 0ULL;
+    unsigned long long owner_user_id = 0ULL;
+    unsigned long long owner_numeric_id = 0ULL;
+    unsigned long long member_count = 0ULL;
+    unsigned long long last_message_seq = 0ULL;
+    if (!parse_unsigned_long_long(cols[1], group_numeric_id)
+        || !parse_unsigned_long_long(cols[5], owner_user_id)
+        || !parse_unsigned_long_long(cols[6], owner_numeric_id)
+        || !parse_unsigned_long_long(cols[9], member_count)
+        || !parse_unsigned_long_long(cols[12], last_message_seq)) {
+        return false;
+    }
+
+    group.conversation_id = (cols[0] == "\\N") ? "" : cols[0];
+    group.group_numeric_id = group_numeric_id;
+    group.name = (cols[2] == "\\N") ? "" : cols[2];
+    group.avatar_url = (cols[3] == "\\N") ? "" : cols[3];
+    group.notice = (cols[4] == "\\N") ? "" : cols[4];
+    group.owner_user_id = owner_user_id;
+    group.owner_numeric_id = owner_numeric_id;
+    group.owner_username = (cols[7] == "\\N") ? "" : cols[7];
+    group.owner_nickname = (cols[8] == "\\N") ? "" : cols[8];
+    group.member_count = static_cast<std::size_t>(member_count);
+    group.created_at = (cols[10] == "\\N") ? "" : cols[10];
+    group.updated_at = (cols[11] == "\\N") ? "" : cols[11];
+    group.last_message_seq = last_message_seq;
+    group.last_message_id = (cols[13] == "\\N") ? "" : cols[13];
+    group.last_message_sent_at = (cols[14] == "\\N") ? "" : cols[14];
+    return true;
+}
+
+bool parse_admin_group_member_cols(const std::vector<std::string>& cols,
+                                   admin_group_member_record& member)
+{
+    if (cols.size() < 10U) {
+        return false;
+    }
+
+    unsigned long long user_id = 0ULL;
+    unsigned long long numeric_id = 0ULL;
+    unsigned long long status = 0ULL;
+    unsigned long long is_online = 0ULL;
+    unsigned long long role = 0ULL;
+    if (!parse_unsigned_long_long(cols[0], user_id)
+        || !parse_unsigned_long_long(cols[1], numeric_id)
+        || !parse_unsigned_long_long(cols[5], status)
+        || !parse_unsigned_long_long(cols[6], is_online)
+        || !parse_unsigned_long_long(cols[8], role)) {
+        return false;
+    }
+
+    member.user_id = user_id;
+    member.numeric_id = numeric_id;
+    member.username = (cols[2] == "\\N") ? "" : cols[2];
+    member.nickname = (cols[3] == "\\N") ? "" : cols[3];
+    member.avatar_url = (cols[4] == "\\N") ? "" : cols[4];
+    member.status = static_cast<unsigned int>(status);
+    member.is_online = (is_online != 0ULL);
+    member.last_seen_at = (cols[7] == "\\N") ? "" : cols[7];
+    member.role = static_cast<unsigned int>(role);
+    member.mute_until = (cols[9] == "\\N") ? "" : cols[9];
+    return true;
+}
+
+bool parse_admin_conversation_cols(const std::vector<std::string>& cols,
+                                   admin_conversation_record& conversation)
+{
+    if (cols.size() < 14U) {
+        return false;
+    }
+
+    unsigned long long conversation_type = 0ULL;
+    unsigned long long group_numeric_id = 0ULL;
+    unsigned long long owner_user_id = 0ULL;
+    unsigned long long member_count = 0ULL;
+    unsigned long long last_message_seq = 0ULL;
+    if (!parse_unsigned_long_long(cols[1], conversation_type)
+        || !parse_unsigned_long_long(cols[2], group_numeric_id)
+        || !parse_unsigned_long_long(cols[6], owner_user_id)
+        || !parse_unsigned_long_long(cols[7], member_count)
+        || !parse_unsigned_long_long(cols[10], last_message_seq)) {
+        return false;
+    }
+
+    conversation.conversation_id = (cols[0] == "\\N") ? "" : cols[0];
+    conversation.conversation_type = static_cast<unsigned int>(conversation_type);
+    conversation.group_numeric_id = group_numeric_id;
+    conversation.name = (cols[3] == "\\N") ? "" : cols[3];
+    conversation.avatar_url = (cols[4] == "\\N") ? "" : cols[4];
+    conversation.notice = (cols[5] == "\\N") ? "" : cols[5];
+    conversation.owner_user_id = owner_user_id;
+    conversation.member_count = static_cast<std::size_t>(member_count);
+    conversation.created_at = (cols[8] == "\\N") ? "" : cols[8];
+    conversation.updated_at = (cols[9] == "\\N") ? "" : cols[9];
+    conversation.last_message_seq = last_message_seq;
+    conversation.last_message_id = (cols[11] == "\\N") ? "" : cols[11];
+    conversation.last_message_sent_at = (cols[12] == "\\N") ? "" : cols[12];
+    conversation.participants_summary = (cols[13] == "\\N") ? "" : cols[13];
+    return true;
+}
+
+bool parse_admin_message_cols(const std::vector<std::string>& cols,
+                              admin_message_record& message)
+{
+    if (cols.size() < 10U) {
+        return false;
+    }
+
+    unsigned long long seq = 0ULL;
+    unsigned long long message_type = 0ULL;
+    unsigned long long sender_user_id = 0ULL;
+    unsigned long long sender_numeric_id = 0ULL;
+    unsigned long long receipt_total = 0ULL;
+    unsigned long long delivered_count = 0ULL;
+    if (!parse_unsigned_long_long(cols[1], seq)
+        || !parse_unsigned_long_long(cols[2], message_type)
+        || !parse_unsigned_long_long(cols[5], sender_user_id)
+        || !parse_unsigned_long_long(cols[6], sender_numeric_id)
+        || !parse_unsigned_long_long(cols[8], receipt_total)
+        || !parse_unsigned_long_long(cols[9], delivered_count)) {
+        return false;
+    }
+
+    message.message_id = (cols[0] == "\\N") ? "" : cols[0];
+    message.seq = seq;
+    message.message_type = message_type;
+    message.content_json = (cols[3] == "\\N") ? "{}" : cols[3];
+    message.sent_at = (cols[4] == "\\N") ? "" : cols[4];
+    message.sender_user_id = sender_user_id;
+    message.sender_numeric_id = sender_numeric_id;
+    message.sender_username = (cols[7] == "\\N") ? "" : cols[7];
+    message.receipt_total = static_cast<std::size_t>(receipt_total);
+    message.delivered_count = static_cast<std::size_t>(delivered_count);
+    message.pending_count = message.receipt_total >= message.delivered_count
+        ? (message.receipt_total - message.delivered_count)
+        : 0U;
+    summarize_message_content(message_type,
+                              message.content_json,
+                              message.message_kind,
+                              message.content_preview,
+                              message.file_id,
+                              message.file_name,
+                              message.file_size_bytes);
+    return true;
+}
+
+bool parse_admin_message_receipt_cols(const std::vector<std::string>& cols,
+                                      admin_message_receipt_record& receipt)
+{
+    if (cols.size() < 5U) {
+        return false;
+    }
+
+    unsigned long long user_id = 0ULL;
+    unsigned long long numeric_id = 0ULL;
+    if (!parse_unsigned_long_long(cols[0], user_id)
+        || !parse_unsigned_long_long(cols[1], numeric_id)) {
+        return false;
+    }
+
+    receipt.user_id = user_id;
+    receipt.numeric_id = numeric_id;
+    receipt.username = (cols[2] == "\\N") ? "" : cols[2];
+    receipt.nickname = (cols[3] == "\\N") ? "" : cols[3];
+    receipt.delivered_at = (cols[4] == "\\N") ? "" : cols[4];
+    receipt.delivered = !receipt.delivered_at.empty();
+    return true;
+}
+
+bool parse_admin_chat_file_cols(const std::vector<std::string>& cols,
+                                admin_chat_file_record& file)
+{
+    if (cols.size() < 16U) {
+        return false;
+    }
+
+    unsigned long long uploader_user_id = 0ULL;
+    unsigned long long uploader_numeric_id = 0ULL;
+    unsigned long long size_bytes = 0ULL;
+    unsigned long long attached_flag = 0ULL;
+    if (!parse_unsigned_long_long(cols[2], uploader_user_id)
+        || !parse_unsigned_long_long(cols[3], uploader_numeric_id)
+        || !parse_unsigned_long_long(cols[11], size_bytes)
+        || !parse_unsigned_long_long(cols[12], attached_flag)) {
+        return false;
+    }
+
+    file.file_id = (cols[0] == "\\N") ? "" : cols[0];
+    file.conversation_id = (cols[1] == "\\N") ? "" : cols[1];
+    file.uploader_user_id = uploader_user_id;
+    file.uploader_numeric_id = uploader_numeric_id;
+    file.uploader_username = (cols[4] == "\\N") ? "" : cols[4];
+    file.uploader_nickname = (cols[5] == "\\N") ? "" : cols[5];
+    file.original_name = (cols[6] == "\\N") ? "" : cols[6];
+    file.stored_name = (cols[7] == "\\N") ? "" : cols[7];
+    file.stored_relative_path = (cols[8] == "\\N") ? "" : cols[8];
+    file.content_type = (cols[9] == "\\N") ? "" : cols[9];
+    file.sha256 = (cols[10] == "\\N") ? "" : cols[10];
+    file.size_bytes = static_cast<std::size_t>(size_bytes);
+    file.attached = (attached_flag != 0ULL);
+    file.bound_message_id = (cols[13] == "\\N") ? "" : cols[13];
+    file.created_at = (cols[14] == "\\N") ? "" : cols[14];
+    file.attached_at = (cols[15] == "\\N") ? "" : cols[15];
+    return true;
+}
+
+bool chat_files_table_exists(const mysql_config& cfg,
+                             bool& exists,
+                             std::string& command_output,
+                             int& exit_code)
+{
+    exists = false;
+    command_output.clear();
+    exit_code = 0;
+    if (!run_mysql_sql(cfg, "SHOW TABLES LIKE 'chat_files';", command_output, exit_code)) {
+        return false;
+    }
+    exists = !collect_non_empty_lines(command_output).empty();
+    return true;
+}
+
 } // namespace
 
 bool list_managed_users(const user_list_options& options,
@@ -1065,6 +1391,654 @@ bool list_managed_users(const user_list_options& options,
         }
         users.push_back(user);
     }
+    return true;
+}
+
+bool load_admin_overview(admin_overview_summary& summary,
+                         user_admin_error& error)
+{
+    summary = admin_overview_summary{};
+    error = user_admin_error{};
+
+    const mysql_config cfg = load_mysql_config();
+    std::string config_error;
+    if (!is_mysql_config_valid(cfg, config_error)) {
+        set_error(error, user_admin_error_code::config, "database config missing", config_error);
+        return false;
+    }
+
+    std::ostringstream summary_sql;
+    summary_sql
+        << "SELECT "
+        << "COUNT(*), "
+        << "COALESCE(SUM(CASE WHEN u.status=1 THEN 1 ELSE 0 END), 0), "
+        << "COALESCE(SUM(CASE WHEN u.status=0 THEN 1 ELSE 0 END), 0), "
+        << "COALESCE(SUM(CASE WHEN COALESCE(p.is_online, 0) <> 0 THEN 1 ELSE 0 END), 0), "
+        << "COALESCE(SUM(CASE WHEN u.last_login_at IS NOT NULL "
+        << "AND u.last_login_at >= DATE_SUB(NOW(), INTERVAL 7 DAY) THEN 1 ELSE 0 END), 0), "
+        << "COALESCE(SUM(CASE WHEN p.last_seen_at IS NOT NULL "
+        << "AND p.last_seen_at >= DATE_SUB(NOW(), INTERVAL 1 DAY) THEN 1 ELSE 0 END), 0) "
+        << "FROM user_data u "
+        << "LEFT JOIN user_im_profile p ON p.user_id=u.id AND p.deleted_at IS NULL;";
+
+    std::string command_output;
+    int exit_code = 0;
+    if (!run_mysql_sql(cfg, summary_sql.str(), command_output, exit_code)) {
+        std::ostringstream debug;
+        debug << "exit_code=" << exit_code << "; output=" << trim_copy(command_output);
+        set_error(error, user_admin_error_code::database, "failed to load admin overview", debug.str());
+        return false;
+    }
+
+    const std::vector<std::string> lines = collect_non_empty_lines(command_output);
+    if (lines.empty()) {
+        set_error(error, user_admin_error_code::database, "failed to load admin overview", "empty overview result");
+        return false;
+    }
+
+    const std::vector<std::string> cols = split_by_tab(lines.back());
+    if (cols.size() < 6U) {
+        set_error(error, user_admin_error_code::database, "failed to parse admin overview", trim_copy(command_output));
+        return false;
+    }
+
+    unsigned long long total_users = 0ULL;
+    unsigned long long enabled_users = 0ULL;
+    unsigned long long disabled_users = 0ULL;
+    unsigned long long online_users = 0ULL;
+    unsigned long long recent_login_users = 0ULL;
+    unsigned long long recent_seen_users = 0ULL;
+    if (!parse_unsigned_long_long(cols[0], total_users)
+        || !parse_unsigned_long_long(cols[1], enabled_users)
+        || !parse_unsigned_long_long(cols[2], disabled_users)
+        || !parse_unsigned_long_long(cols[3], online_users)
+        || !parse_unsigned_long_long(cols[4], recent_login_users)
+        || !parse_unsigned_long_long(cols[5], recent_seen_users)) {
+        set_error(error, user_admin_error_code::database, "failed to parse admin overview", trim_copy(command_output));
+        return false;
+    }
+
+    summary.total_users = static_cast<std::size_t>(total_users);
+    summary.enabled_users = static_cast<std::size_t>(enabled_users);
+    summary.disabled_users = static_cast<std::size_t>(disabled_users);
+    summary.online_users = static_cast<std::size_t>(online_users);
+    summary.recent_login_users = static_cast<std::size_t>(recent_login_users);
+    summary.recent_seen_users = static_cast<std::size_t>(recent_seen_users);
+
+    std::ostringstream recent_sql;
+    recent_sql << build_user_select_sql()
+               << "ORDER BY "
+               << "CASE WHEN u.last_login_at IS NULL THEN 1 ELSE 0 END ASC, "
+               << "u.last_login_at DESC, "
+               << "u.created_at DESC, "
+               << "u.id DESC "
+               << "LIMIT 6;";
+
+    command_output.clear();
+    exit_code = 0;
+    if (!run_mysql_sql(cfg, recent_sql.str(), command_output, exit_code)) {
+        std::ostringstream debug;
+        debug << "exit_code=" << exit_code << "; output=" << trim_copy(command_output);
+        set_error(error, user_admin_error_code::database, "failed to load recent users", debug.str());
+        return false;
+    }
+
+    const std::vector<std::string> recent_lines = collect_non_empty_lines(command_output);
+    summary.recent_users.reserve(recent_lines.size());
+    for (const std::string& line : recent_lines) {
+        managed_user_record user;
+        if (!parse_managed_user_cols(split_by_tab(line), user)) {
+            set_error(error, user_admin_error_code::database, "failed to parse recent user row", line);
+            return false;
+        }
+        summary.recent_users.push_back(user);
+    }
+    return true;
+}
+
+bool list_admin_groups(const admin_group_list_options& options,
+                       std::vector<admin_group_record>& groups,
+                       user_admin_error& error)
+{
+    groups.clear();
+    error = user_admin_error{};
+
+    const mysql_config cfg = load_mysql_config();
+    std::string config_error;
+    if (!is_mysql_config_valid(cfg, config_error)) {
+        set_error(error, user_admin_error_code::config, "database config missing", config_error);
+        return false;
+    }
+
+    const std::size_t raw_limit = options.limit == 0U ? 50U : options.limit;
+    const std::size_t limit = std::min<std::size_t>(raw_limit, 200U);
+    const std::string keyword = trim_copy(options.keyword);
+
+    std::ostringstream sql;
+    sql << "SELECT "
+        << "c.conversation_uuid, "
+        << "COALESCE(c.group_numeric_id, 0), "
+        << mysql_text_sql("c.name") << ", "
+        << mysql_text_sql("c.avatar_url") << ", "
+        << mysql_text_sql("c.notice") << ", "
+        << "COALESCE(c.owner_user_id, 0), "
+        << "COALESCE(owner.numeric_id, 0), "
+        << mysql_text_sql("owner.username") << ", "
+        << mysql_text_sql("op.nickname") << ", "
+        << "(SELECT COUNT(*) FROM conversation_members cm WHERE cm.conversation_id=c.id), "
+        << "COALESCE(DATE_FORMAT(c.created_at, '%Y-%m-%d %H:%i:%s'), ''), "
+        << "COALESCE(DATE_FORMAT(c.updated_at, '%Y-%m-%d %H:%i:%s'), ''), "
+        << "COALESCE(lastm.seq, 0), "
+        << mysql_text_sql("lastm.message_uuid") << ", "
+        << "COALESCE(DATE_FORMAT(lastm.created_at, '%Y-%m-%d %H:%i:%s'), '') "
+        << "FROM conversations c "
+        << "LEFT JOIN user_data owner ON owner.id=c.owner_user_id "
+        << "LEFT JOIN user_im_profile op ON op.user_id=owner.id AND op.deleted_at IS NULL "
+        << "LEFT JOIN messages lastm ON lastm.id=c.last_message_id "
+        << "WHERE c.type=2 ";
+    if (options.group_numeric_id != 0ULL) {
+        sql << "AND c.group_numeric_id=" << options.group_numeric_id << " ";
+    }
+    if (options.owner_user_id != 0ULL) {
+        sql << "AND c.owner_user_id=" << options.owner_user_id << " ";
+    }
+    if (!keyword.empty()) {
+        const std::string escaped = sql_escape(keyword);
+        sql << "AND ("
+            << "c.conversation_uuid LIKE '%" << escaped << "%' "
+            << "OR COALESCE(c.name, '') LIKE '%" << escaped << "%' "
+            << "OR COALESCE(owner.username, '') LIKE '%" << escaped << "%' "
+            << "OR COALESCE(op.nickname, '') LIKE '%" << escaped << "%'"
+            << ") ";
+    }
+    sql << "ORDER BY c.updated_at DESC, c.id DESC "
+        << "LIMIT " << static_cast<unsigned long long>(limit) << ";";
+
+    std::string command_output;
+    int exit_code = 0;
+    if (!run_mysql_sql(cfg, sql.str(), command_output, exit_code)) {
+        std::ostringstream debug;
+        debug << "exit_code=" << exit_code << "; output=" << trim_copy(command_output);
+        set_error(error, user_admin_error_code::database, "failed to list groups", debug.str());
+        return false;
+    }
+
+    const std::vector<std::string> lines = collect_non_empty_lines(command_output);
+    groups.reserve(lines.size());
+    for (const std::string& line : lines) {
+        admin_group_record group;
+        if (!parse_admin_group_cols(split_by_tab(line), group)) {
+            set_error(error, user_admin_error_code::database, "failed to parse group row", line);
+            return false;
+        }
+        groups.push_back(group);
+    }
+    return true;
+}
+
+bool list_admin_conversations(const admin_conversation_list_options& options,
+                              std::vector<admin_conversation_record>& conversations,
+                              user_admin_error& error)
+{
+    conversations.clear();
+    error = user_admin_error{};
+
+    const mysql_config cfg = load_mysql_config();
+    std::string config_error;
+    if (!is_mysql_config_valid(cfg, config_error)) {
+        set_error(error, user_admin_error_code::config, "database config missing", config_error);
+        return false;
+    }
+
+    const std::size_t raw_limit = options.limit == 0U ? 50U : options.limit;
+    const std::size_t limit = std::min<std::size_t>(raw_limit, 200U);
+    const std::string keyword = trim_copy(options.keyword);
+    const std::string conversation_id = trim_copy(options.conversation_id);
+    const std::string participants_summary_sql = mysql_text_sql(
+        "(SELECT GROUP_CONCAT(CONCAT(COALESCE(u.numeric_id, 0), ':', "
+        + mysql_text_sql("u.username")
+        + ", ':', "
+        + mysql_text_sql("p.nickname")
+        + ") ORDER BY u.id SEPARATOR ' || ') "
+        + "FROM conversation_members cm2 "
+        + "JOIN user_data u ON u.id=cm2.user_id "
+        + "LEFT JOIN user_im_profile p ON p.user_id=u.id AND p.deleted_at IS NULL "
+        + "WHERE cm2.conversation_id=c.id)");
+
+    std::ostringstream sql;
+    sql << "SELECT "
+        << "c.conversation_uuid, "
+        << "c.type, "
+        << "COALESCE(c.group_numeric_id, 0), "
+        << mysql_text_sql("c.name") << ", "
+        << mysql_text_sql("c.avatar_url") << ", "
+        << mysql_text_sql("c.notice") << ", "
+        << "COALESCE(c.owner_user_id, 0), "
+        << "(SELECT COUNT(*) FROM conversation_members cm WHERE cm.conversation_id=c.id), "
+        << "COALESCE(DATE_FORMAT(c.created_at, '%Y-%m-%d %H:%i:%s'), ''), "
+        << "COALESCE(DATE_FORMAT(c.updated_at, '%Y-%m-%d %H:%i:%s'), ''), "
+        << "COALESCE(lastm.seq, 0), "
+        << mysql_text_sql("lastm.message_uuid") << ", "
+        << "COALESCE(DATE_FORMAT(lastm.created_at, '%Y-%m-%d %H:%i:%s'), ''), "
+        << participants_summary_sql << " "
+        << "FROM conversations c "
+        << "LEFT JOIN messages lastm ON lastm.id=c.last_message_id "
+        << "WHERE 1=1 ";
+    if (!conversation_id.empty()) {
+        sql << "AND c.conversation_uuid='" << sql_escape(conversation_id) << "' ";
+    }
+    if (options.group_numeric_id != 0ULL) {
+        sql << "AND c.group_numeric_id=" << options.group_numeric_id << " ";
+    }
+    if (options.user_id != 0ULL) {
+        sql << "AND EXISTS(SELECT 1 FROM conversation_members cmu WHERE cmu.conversation_id=c.id AND cmu.user_id="
+            << options.user_id << ") ";
+    }
+    if (options.numeric_id != 0ULL) {
+        sql << "AND EXISTS(SELECT 1 FROM conversation_members cmn "
+            << "JOIN user_data un ON un.id=cmn.user_id "
+            << "WHERE cmn.conversation_id=c.id AND COALESCE(un.numeric_id, 0)=" << options.numeric_id << ") ";
+    }
+    if (!keyword.empty()) {
+        const std::string escaped = sql_escape(keyword);
+        sql << "AND ("
+            << "c.conversation_uuid LIKE '%" << escaped << "%' "
+            << "OR COALESCE(c.name, '') LIKE '%" << escaped << "%' "
+            << "OR EXISTS(SELECT 1 FROM conversation_members cmk "
+            << "JOIN user_data uk ON uk.id=cmk.user_id "
+            << "LEFT JOIN user_im_profile pk ON pk.user_id=uk.id AND pk.deleted_at IS NULL "
+            << "WHERE cmk.conversation_id=c.id "
+            << "AND (uk.username LIKE '%" << escaped << "%' OR COALESCE(pk.nickname, '') LIKE '%" << escaped << "%'))"
+            << ") ";
+    }
+    sql << "ORDER BY c.updated_at DESC, c.id DESC "
+        << "LIMIT " << static_cast<unsigned long long>(limit) << ";";
+
+    std::string command_output;
+    int exit_code = 0;
+    if (!run_mysql_sql(cfg, sql.str(), command_output, exit_code)) {
+        std::ostringstream debug;
+        debug << "exit_code=" << exit_code << "; output=" << trim_copy(command_output);
+        set_error(error, user_admin_error_code::database, "failed to list conversations", debug.str());
+        return false;
+    }
+
+    const std::vector<std::string> lines = collect_non_empty_lines(command_output);
+    conversations.reserve(lines.size());
+    for (const std::string& line : lines) {
+        admin_conversation_record conversation;
+        if (!parse_admin_conversation_cols(split_by_tab(line), conversation)) {
+            set_error(error, user_admin_error_code::database, "failed to parse conversation row", line);
+            return false;
+        }
+        conversations.push_back(conversation);
+    }
+    return true;
+}
+
+bool list_admin_conversation_messages(const std::string& conversation_id,
+                                      const admin_message_list_options& options,
+                                      std::vector<admin_message_record>& messages,
+                                      user_admin_error& error)
+{
+    messages.clear();
+    error = user_admin_error{};
+
+    const std::string trimmed_conversation_id = trim_copy(conversation_id);
+    if (trimmed_conversation_id.empty()) {
+        set_error(error, user_admin_error_code::validation, "conversation_id is required");
+        return false;
+    }
+
+    const mysql_config cfg = load_mysql_config();
+    std::string config_error;
+    if (!is_mysql_config_valid(cfg, config_error)) {
+        set_error(error, user_admin_error_code::config, "database config missing", config_error);
+        return false;
+    }
+
+    const std::size_t raw_limit = options.limit == 0U ? 50U : options.limit;
+    const std::size_t limit = std::min<std::size_t>(raw_limit, 200U);
+
+    std::ostringstream sql;
+    sql << "SELECT "
+        << "m.message_uuid, "
+        << "m.seq, "
+        << "m.message_type, "
+        << mysql_sanitized_sql("m.content", "'{}'") << ", "
+        << "COALESCE(DATE_FORMAT(m.created_at, '%Y-%m-%d %H:%i:%s'), ''), "
+        << "COALESCE(u.id, 0), "
+        << "COALESCE(u.numeric_id, 0), "
+        << mysql_text_sql("u.username") << ", "
+        << "(SELECT COUNT(*) FROM message_receipts mr WHERE mr.message_id=m.id), "
+        << "(SELECT COUNT(*) FROM message_receipts mr WHERE mr.message_id=m.id AND mr.delivered_at IS NOT NULL) "
+        << "FROM messages m "
+        << "JOIN conversations c ON c.id=m.conversation_id "
+        << "LEFT JOIN user_data u ON u.id=m.sender_user_id "
+        << "WHERE c.conversation_uuid='" << sql_escape(trimmed_conversation_id) << "' "
+        << "ORDER BY m.seq DESC "
+        << "LIMIT " << static_cast<unsigned long long>(limit) << ";";
+
+    std::string command_output;
+    int exit_code = 0;
+    if (!run_mysql_sql(cfg, sql.str(), command_output, exit_code)) {
+        std::ostringstream debug;
+        debug << "exit_code=" << exit_code << "; output=" << trim_copy(command_output);
+        set_error(error, user_admin_error_code::database, "failed to list conversation messages", debug.str());
+        return false;
+    }
+
+    const std::vector<std::string> lines = collect_non_empty_lines(command_output);
+    messages.reserve(lines.size());
+    for (const std::string& line : lines) {
+        admin_message_record message;
+        if (!parse_admin_message_cols(split_by_tab(line), message)) {
+            set_error(error, user_admin_error_code::database, "failed to parse message row", line);
+            return false;
+        }
+        message.conversation_id = trimmed_conversation_id;
+        messages.push_back(message);
+    }
+    return true;
+}
+
+bool list_admin_message_receipts(const std::string& conversation_id,
+                                 const std::string& message_id,
+                                 std::vector<admin_message_receipt_record>& receipts,
+                                 user_admin_error& error)
+{
+    receipts.clear();
+    error = user_admin_error{};
+
+    const std::string trimmed_conversation_id = trim_copy(conversation_id);
+    const std::string trimmed_message_id = trim_copy(message_id);
+    if (trimmed_conversation_id.empty() || trimmed_message_id.empty()) {
+        set_error(error, user_admin_error_code::validation, "conversation_id and message_id are required");
+        return false;
+    }
+
+    const mysql_config cfg = load_mysql_config();
+    std::string config_error;
+    if (!is_mysql_config_valid(cfg, config_error)) {
+        set_error(error, user_admin_error_code::config, "database config missing", config_error);
+        return false;
+    }
+
+    std::ostringstream sql;
+    sql << "SELECT "
+        << "u.id, "
+        << "COALESCE(u.numeric_id, 0), "
+        << mysql_text_sql("u.username") << ", "
+        << mysql_text_sql("p.nickname") << ", "
+        << "COALESCE(DATE_FORMAT(mr.delivered_at, '%Y-%m-%d %H:%i:%s'), '') "
+        << "FROM message_receipts mr "
+        << "JOIN messages m ON m.id=mr.message_id "
+        << "JOIN conversations c ON c.id=m.conversation_id "
+        << "JOIN user_data u ON u.id=mr.user_id "
+        << "LEFT JOIN user_im_profile p ON p.user_id=u.id AND p.deleted_at IS NULL "
+        << "WHERE c.conversation_uuid='" << sql_escape(trimmed_conversation_id) << "' "
+        << "AND m.message_uuid='" << sql_escape(trimmed_message_id) << "' "
+        << "ORDER BY mr.delivered_at IS NULL DESC, mr.delivered_at ASC, u.id ASC;";
+
+    std::string command_output;
+    int exit_code = 0;
+    if (!run_mysql_sql(cfg, sql.str(), command_output, exit_code)) {
+        std::ostringstream debug;
+        debug << "exit_code=" << exit_code << "; output=" << trim_copy(command_output);
+        set_error(error, user_admin_error_code::database, "failed to list message receipts", debug.str());
+        return false;
+    }
+
+    const std::vector<std::string> lines = collect_non_empty_lines(command_output);
+    receipts.reserve(lines.size());
+    for (const std::string& line : lines) {
+        admin_message_receipt_record receipt;
+        if (!parse_admin_message_receipt_cols(split_by_tab(line), receipt)) {
+            set_error(error, user_admin_error_code::database, "failed to parse message receipt row", line);
+            return false;
+        }
+        receipts.push_back(receipt);
+    }
+    return true;
+}
+
+bool load_admin_group_detail(const std::string& conversation_id,
+                             admin_group_record& group,
+                             std::vector<admin_group_member_record>& members,
+                             std::vector<admin_message_record>& recent_messages,
+                             user_admin_error& error)
+{
+    group = admin_group_record{};
+    members.clear();
+    recent_messages.clear();
+    error = user_admin_error{};
+
+    const std::string trimmed_conversation_id = trim_copy(conversation_id);
+    if (trimmed_conversation_id.empty()) {
+        set_error(error, user_admin_error_code::validation, "conversation_id is required");
+        return false;
+    }
+
+    const mysql_config cfg = load_mysql_config();
+    std::string config_error;
+    if (!is_mysql_config_valid(cfg, config_error)) {
+        set_error(error, user_admin_error_code::config, "database config missing", config_error);
+        return false;
+    }
+
+    std::ostringstream group_sql;
+    group_sql << "SELECT "
+              << "c.conversation_uuid, "
+              << "COALESCE(c.group_numeric_id, 0), "
+              << mysql_text_sql("c.name") << ", "
+              << mysql_text_sql("c.avatar_url") << ", "
+              << mysql_text_sql("c.notice") << ", "
+              << "COALESCE(c.owner_user_id, 0), "
+              << "COALESCE(owner.numeric_id, 0), "
+              << mysql_text_sql("owner.username") << ", "
+              << mysql_text_sql("op.nickname") << ", "
+              << "(SELECT COUNT(*) FROM conversation_members cm WHERE cm.conversation_id=c.id), "
+              << "COALESCE(DATE_FORMAT(c.created_at, '%Y-%m-%d %H:%i:%s'), ''), "
+              << "COALESCE(DATE_FORMAT(c.updated_at, '%Y-%m-%d %H:%i:%s'), ''), "
+              << "COALESCE(lastm.seq, 0), "
+              << mysql_text_sql("lastm.message_uuid") << ", "
+              << "COALESCE(DATE_FORMAT(lastm.created_at, '%Y-%m-%d %H:%i:%s'), '') "
+              << "FROM conversations c "
+              << "LEFT JOIN user_data owner ON owner.id=c.owner_user_id "
+              << "LEFT JOIN user_im_profile op ON op.user_id=owner.id AND op.deleted_at IS NULL "
+              << "LEFT JOIN messages lastm ON lastm.id=c.last_message_id "
+              << "WHERE c.type=2 AND c.conversation_uuid='" << sql_escape(trimmed_conversation_id) << "' "
+              << "LIMIT 1;";
+
+    std::string command_output;
+    int exit_code = 0;
+    if (!run_mysql_sql(cfg, group_sql.str(), command_output, exit_code)) {
+        std::ostringstream debug;
+        debug << "exit_code=" << exit_code << "; output=" << trim_copy(command_output);
+        set_error(error, user_admin_error_code::database, "failed to load group detail", debug.str());
+        return false;
+    }
+
+    const std::vector<std::string> group_lines = collect_non_empty_lines(command_output);
+    if (group_lines.empty()) {
+        set_error(error, user_admin_error_code::not_found, "group not found");
+        return false;
+    }
+    if (!parse_admin_group_cols(split_by_tab(group_lines.front()), group)) {
+        set_error(error, user_admin_error_code::database, "failed to parse group detail row", group_lines.front());
+        return false;
+    }
+
+    std::ostringstream members_sql;
+    members_sql << "SELECT "
+                << "u.id, "
+                << "COALESCE(u.numeric_id, 0), "
+                << mysql_text_sql("u.username") << ", "
+                << mysql_text_sql("p.nickname") << ", "
+                << mysql_text_sql("p.avatar_url") << ", "
+                << "COALESCE(u.status, 0), "
+                << "COALESCE(p.is_online, 0), "
+                << "COALESCE(DATE_FORMAT(p.last_seen_at, '%Y-%m-%d %H:%i:%s'), ''), "
+                << "COALESCE(cm.role, 0), "
+                << "COALESCE(DATE_FORMAT(cm.mute_until, '%Y-%m-%d %H:%i:%s'), '') "
+                << "FROM conversations c "
+                << "JOIN conversation_members cm ON cm.conversation_id=c.id "
+                << "JOIN user_data u ON u.id=cm.user_id "
+                << "LEFT JOIN user_im_profile p ON p.user_id=u.id AND p.deleted_at IS NULL "
+                << "WHERE c.conversation_uuid='" << sql_escape(trimmed_conversation_id) << "' "
+                << "ORDER BY cm.role DESC, u.id ASC;";
+
+    command_output.clear();
+    exit_code = 0;
+    if (!run_mysql_sql(cfg, members_sql.str(), command_output, exit_code)) {
+        std::ostringstream debug;
+        debug << "exit_code=" << exit_code << "; output=" << trim_copy(command_output);
+        set_error(error, user_admin_error_code::database, "failed to load group members", debug.str());
+        return false;
+    }
+
+    const std::vector<std::string> member_lines = collect_non_empty_lines(command_output);
+    members.reserve(member_lines.size());
+    for (const std::string& line : member_lines) {
+        admin_group_member_record member;
+        if (!parse_admin_group_member_cols(split_by_tab(line), member)) {
+            set_error(error, user_admin_error_code::database, "failed to parse group member row", line);
+            return false;
+        }
+        members.push_back(member);
+    }
+
+    admin_message_list_options message_options;
+    message_options.limit = 20U;
+    if (!list_admin_conversation_messages(trimmed_conversation_id, message_options, recent_messages, error)) {
+        return false;
+    }
+    return true;
+}
+
+bool list_admin_chat_files(const admin_chat_file_list_options& options,
+                           std::vector<admin_chat_file_record>& files,
+                           user_admin_error& error)
+{
+    files.clear();
+    error = user_admin_error{};
+
+    const mysql_config cfg = load_mysql_config();
+    std::string config_error;
+    if (!is_mysql_config_valid(cfg, config_error)) {
+        set_error(error, user_admin_error_code::config, "database config missing", config_error);
+        return false;
+    }
+
+    bool table_exists = false;
+    std::string command_output;
+    int exit_code = 0;
+    if (!chat_files_table_exists(cfg, table_exists, command_output, exit_code)) {
+        std::ostringstream debug;
+        debug << "exit_code=" << exit_code << "; output=" << trim_copy(command_output);
+        set_error(error, user_admin_error_code::database, "failed to check chat_files table", debug.str());
+        return false;
+    }
+    if (!table_exists) {
+        return true;
+    }
+
+    const std::size_t raw_limit = options.limit == 0U ? 50U : options.limit;
+    const std::size_t limit = std::min<std::size_t>(raw_limit, 200U);
+    const std::string keyword = trim_copy(options.keyword);
+    const std::string conversation_id = trim_copy(options.conversation_id);
+    const std::string file_id = trim_copy(options.file_id);
+
+    std::ostringstream sql;
+    sql << "SELECT "
+        << "cf.file_uuid, "
+        << "cf.conversation_uuid, "
+        << "cf.uploader_user_id, "
+        << "COALESCE(u.numeric_id, 0), "
+        << mysql_text_sql("u.username") << ", "
+        << mysql_text_sql("p.nickname") << ", "
+        << mysql_text_sql("cf.original_name") << ", "
+        << "COALESCE(cf.stored_name, ''), "
+        << "COALESCE(cf.stored_relative_path, ''), "
+        << "COALESCE(cf.content_type, ''), "
+        << "COALESCE(cf.sha256, ''), "
+        << "cf.size_bytes, "
+        << "CASE WHEN cf.bound_message_uuid IS NULL OR cf.bound_message_uuid='' THEN 0 ELSE 1 END, "
+        << "COALESCE(cf.bound_message_uuid, ''), "
+        << "COALESCE(DATE_FORMAT(cf.created_at, '%Y-%m-%d %H:%i:%s'), ''), "
+        << "COALESCE(DATE_FORMAT(cf.attached_at, '%Y-%m-%d %H:%i:%s'), '') "
+        << "FROM chat_files cf "
+        << "LEFT JOIN user_data u ON u.id=cf.uploader_user_id "
+        << "LEFT JOIN user_im_profile p ON p.user_id=u.id AND p.deleted_at IS NULL "
+        << "WHERE 1=1 ";
+    if (!conversation_id.empty()) {
+        sql << "AND cf.conversation_uuid='" << sql_escape(conversation_id) << "' ";
+    }
+    if (!file_id.empty()) {
+        sql << "AND cf.file_uuid='" << sql_escape(file_id) << "' ";
+    }
+    if (options.uploader_user_id != 0ULL) {
+        sql << "AND cf.uploader_user_id=" << options.uploader_user_id << " ";
+    }
+    if (!keyword.empty()) {
+        const std::string escaped = sql_escape(keyword);
+        sql << "AND ("
+            << "cf.file_uuid LIKE '%" << escaped << "%' "
+            << "OR cf.original_name LIKE '%" << escaped << "%' "
+            << "OR cf.stored_name LIKE '%" << escaped << "%' "
+            << "OR cf.sha256 LIKE '%" << escaped << "%'"
+            << ") ";
+    }
+    sql << "ORDER BY cf.created_at DESC, cf.id DESC "
+        << "LIMIT " << static_cast<unsigned long long>(limit) << ";";
+
+    command_output.clear();
+    exit_code = 0;
+    if (!run_mysql_sql(cfg, sql.str(), command_output, exit_code)) {
+        std::ostringstream debug;
+        debug << "exit_code=" << exit_code << "; output=" << trim_copy(command_output);
+        set_error(error, user_admin_error_code::database, "failed to list chat files", debug.str());
+        return false;
+    }
+
+    const std::vector<std::string> lines = collect_non_empty_lines(command_output);
+    files.reserve(lines.size());
+    for (const std::string& line : lines) {
+        admin_chat_file_record file;
+        if (!parse_admin_chat_file_cols(split_by_tab(line), file)) {
+            set_error(error, user_admin_error_code::database, "failed to parse chat file row", line);
+            return false;
+        }
+        files.push_back(file);
+    }
+    return true;
+}
+
+bool load_admin_chat_file(const std::string& file_id,
+                          admin_chat_file_record& file,
+                          user_admin_error& error)
+{
+    file = admin_chat_file_record{};
+    error = user_admin_error{};
+
+    const std::string trimmed_file_id = trim_copy(file_id);
+    if (trimmed_file_id.empty()) {
+        set_error(error, user_admin_error_code::validation, "file_id is required");
+        return false;
+    }
+
+    admin_chat_file_list_options options;
+    options.file_id = trimmed_file_id;
+    options.limit = 1U;
+    std::vector<admin_chat_file_record> files;
+    if (!list_admin_chat_files(options, files, error)) {
+        return false;
+    }
+    if (files.empty()) {
+        set_error(error, user_admin_error_code::not_found, "chat file not found");
+        return false;
+    }
+    file = files.front();
     return true;
 }
 
